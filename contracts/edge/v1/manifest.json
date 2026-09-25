@@ -1,0 +1,9 @@
+{
+  "version": "1.0.0-draft.1",
+  "files": {
+    "access-event.schema.json": "861a17494d94831709182044de62c25a56e80a44bd3d8402bd6bd55179b2a1e0",
+    "configuration.schema.json": "23a3cc71a5757503e97f76d8a8726af4cbc34a389c82436de18262bcf37364a2",
+    "heartbeat.schema.json": "ca786266223e3097912a1117e9c083fad6e6cf7d16e3d253d5f3003926275f97"
+  }
+}
+

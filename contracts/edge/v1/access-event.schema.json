@@ -1,0 +1,131 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:smartgate:edge:v1:access-event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "organization_id",
+    "edge_id",
+    "lane_id",
+    "observed_at",
+    "edge_sequence",
+    "format",
+    "value",
+    "credential_id",
+    "vehicle_id",
+    "vehicle_plate",
+    "decision",
+    "reason",
+    "barrier_outcome",
+    "passage_confirmed",
+    "config_version",
+    "offline"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "event_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "organization_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "edge_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "lane_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "edge_sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "format": {
+      "enum": [
+        "epc",
+        "wiegand26",
+        "wiegand34"
+      ]
+    },
+    "value": {
+      "type": "string",
+      "pattern": "^[0-9A-F]{1,64}$"
+    },
+    "credential_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vehicle_id": {
+      "anyOf": [
+        {
+          "type": "string",
+          "format": "uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "vehicle_plate": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 20
+    },
+    "decision": {
+      "enum": [
+        "granted",
+        "denied"
+      ]
+    },
+    "reason": {
+      "enum": [
+        "VALID_CREDENTIAL",
+        "UNKNOWN_CREDENTIAL",
+        "CREDENTIAL_INACTIVE",
+        "GATE_NOT_ALLOWED",
+        "OUTSIDE_VALIDITY",
+        "NO_CONFIGURATION",
+        "CLOCK_UNTRUSTED"
+      ]
+    },
+    "barrier_outcome": {
+      "enum": [
+        "not_requested",
+        "simulated_open",
+        "cooldown",
+        "fault"
+      ]
+    },
+    "passage_confirmed": {
+      "const": false
+    },
+    "config_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "offline": {
+      "type": "boolean"
+    }
+  }
+}
+

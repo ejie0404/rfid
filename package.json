@@ -1,0 +1,33 @@
+{
+  "name": "smartgate-platform",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "demo": "node scripts/demo.mjs",
+    "build:packages": "npm run build --workspace=@smartgate/contracts && npm run build --workspace=@smartgate/permissions",
+    "build": "npm run build:packages && npm run build --workspace=@smartgate/api && npm run build --workspace=@smartgate/control-web && npm run build --workspace=@smartgate/guard-web && npm run build --workspace=@smartgate/resident-web",
+    "typecheck": "npm run build:packages && npm run typecheck --workspaces --if-present",
+    "test": "npm run build:packages && npm run build --workspace=@smartgate/api && node --test tests/*.test.mjs",
+    "dev:api": "npm run build:packages && npm run dev --workspace=@smartgate/api",
+    "dev:control": "npm run dev --workspace=@smartgate/control-web",
+    "dev:guard": "npm run dev --workspace=@smartgate/guard-web",
+    "dev:resident": "npm run dev --workspace=@smartgate/resident-web",
+    "protocol:check": "node scripts/protocol.mjs check",
+    "protocol:bundle": "node scripts/protocol.mjs bundle"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "3.9.9",
+    "typescript": "5.9.3"
+  }
+}

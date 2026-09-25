@@ -1,0 +1,118 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:smartgate:edge:v1:configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "organization_id",
+    "edge_id",
+    "site_id",
+    "version",
+    "generated_at",
+    "credentials"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "organization_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "edge_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "site_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "credentials": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "format",
+          "value",
+          "status",
+          "vehicle_id",
+          "vehicle_plate",
+          "lane_ids",
+          "valid_from",
+          "valid_until"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "format": {
+            "enum": [
+              "epc",
+              "wiegand26",
+              "wiegand34"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "pattern": "^[0-9A-F]{1,64}$"
+          },
+          "status": {
+            "enum": [
+              "active",
+              "suspended",
+              "lost",
+              "revoked"
+            ]
+          },
+          "vehicle_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "vehicle_plate": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 20
+          },
+          "lane_ids": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "format": "uuid"
+            },
+            "minItems": 1,
+            "uniqueItems": true
+          },
+          "valid_from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "valid_until": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      }
+    }
+  }
+}
+
