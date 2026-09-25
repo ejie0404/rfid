@@ -5,7 +5,13 @@ const ajv = new Ajv({ allErrors: true, strict: false });
 // ajv-formats exposes a CJS default under NodeNext.
 const addFormats = formats as unknown as (instance: Ajv) => void;
 addFormats(ajv);
-const schemas = ["configuration", "access-event", "heartbeat"] as const;
+const schemas = [
+  "configuration",
+  "access-event",
+  "heartbeat",
+  "controller-enrollment",
+  "controller-enrollment-response",
+] as const;
 const validators = Object.fromEntries(
   schemas.map((name) => [
     name,
@@ -30,7 +36,11 @@ export const IDS = {
   otherOrganization: "22222222-2222-4222-8222-222222222222",
   edge: "33333333-3333-4333-8333-333333333333",
   site: "44444444-4444-4444-8444-444444444444",
+  serviceSite: "77777777-7777-4777-8777-777777777771",
+  otherSite: "77777777-7777-4777-8777-777777777772",
   lane: "55555555-5555-4555-8555-555555555555",
+  serviceLane: "88888888-8888-4888-8888-888888888881",
+  otherLane: "88888888-8888-4888-8888-888888888882",
   property: "66666666-6666-4666-8666-666666666666",
 } as const;
 export const DEMO_EDGE_TOKEN = "smartgate-local-simulator-only";
@@ -51,6 +61,8 @@ export interface Configuration {
   organization_id: string;
   edge_id: string;
   site_id: string;
+  /** Lanes this authenticated controller may serve. Absent only on legacy simulator output. */
+  lane_ids?: string[];
   version: number;
   generated_at: string;
   credentials: Credential[];

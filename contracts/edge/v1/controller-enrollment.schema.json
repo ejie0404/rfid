@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:smartgate:edge:v1:controller-enrollment",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "enrollment_code",
+    "installation_id",
+    "protocol_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "enrollment_code": {
+      "type": "string",
+      "pattern": "^sge_[A-Za-z0-9_-]{32}$"
+    },
+    "installation_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "protocol_version": {
+      "const": 1
+    },
+    "software_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 40
+    }
+  }
+}

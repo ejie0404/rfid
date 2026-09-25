@@ -1,9 +1,10 @@
 {
-  "version": "1.0.0-draft.1",
+  "version": "1.0.0-draft.2",
   "files": {
     "access-event.schema.json": "861a17494d94831709182044de62c25a56e80a44bd3d8402bd6bd55179b2a1e0",
-    "configuration.schema.json": "23a3cc71a5757503e97f76d8a8726af4cbc34a389c82436de18262bcf37364a2",
-    "heartbeat.schema.json": "ca786266223e3097912a1117e9c083fad6e6cf7d16e3d253d5f3003926275f97"
+    "configuration.schema.json": "add3465499915286a7c53301302b4ae2f5d08ccfa25a1c4a53a334749ac76f5c",
+    "controller-enrollment-response.schema.json": "559c99ae786597695a4b4d77d159da5d693b376a9567117ea7f1a853f885c0c0",
+    "controller-enrollment.schema.json": "e775f96e4221a35c149c84da55cd035fdf16ae25fdd00b9132162fffe13a0fe5",
+    "heartbeat.schema.json": "0f93cb08c44f3b4ea3de5439d4bf7486c18f7e1439370a01c53464fd262840cd"
   }
 }
-

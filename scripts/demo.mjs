@@ -15,7 +15,9 @@ for (const [name] of outputs)
     throw new Error("Run npm run build first.");
 const api = spawn(process.execPath, ["apps/api/dist/main.js"], {
   cwd: root,
-  env: { ...process.env, SMARTGATE_DEMO: "true" },
+  // The preview is a development mode by definition, so the mode is set here rather than
+  // inherited: a production NODE_ENV in the shell would otherwise refuse to start.
+  env: { ...process.env, NODE_ENV: "development", SMARTGATE_DEMO: "true" },
   stdio: "inherit",
 });
 const servers = [];

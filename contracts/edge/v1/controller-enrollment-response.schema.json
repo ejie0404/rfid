@@ -1,0 +1,49 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "urn:smartgate:edge:v1:controller-enrollment-response",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "controller_id",
+    "credential",
+    "organization_id",
+    "site_id",
+    "lane_ids",
+    "protocol_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "controller_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "credential": {
+      "type": "string",
+      "pattern": "^sgc_[A-Za-z0-9_-]{43}$"
+    },
+    "organization_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "site_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "lane_ids": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "format": "uuid"
+      }
+    },
+    "protocol_version": {
+      "const": 1
+    }
+  }
+}

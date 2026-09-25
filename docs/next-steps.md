@@ -1,136 +1,69 @@
-# SmartGate: next implementation plan
+# SmartGate: plan from the current prototype to one supervised gate pilot
 
-**Next milestone: real accounts and usable HOA, homeowner, and guard dashboards, with controller enrollment and Hikvision integration discovery running alongside the app work.**
+For slice-by-slice deliverables, dependencies, and acceptance checks, see the [detailed implementation plan](detailed-implementation-plan.md).
 
-The current prototype proves the simulated enrollment → local authorization → event synchronization flow. The next work should make that foundation usable by real organizations and establish the connection to the first actual gate.
+Updated 25 September 2026. This plan covers the platform repository (API and three web apps) and the separate Go edge repository. It does not assume that a Hikvision device protocol or Philippine hardware SKU has been confirmed.
 
-This is a proposed sequence. Creating this plan does not start the implementation, publish repositories, purchase hardware, or deploy a system.
+## Current starting point
 
-## App delivery tracks
+- Both repositories are separate Git roots on `main`; the platform foundation is committed locally and the edge foundation is committed as `bfd049b`. Neither repository has a remote.
+- The HOA can create sites and lanes, issue a single-use enrollment grant, and view controller scope and sync health. Real sync authenticates with a per-controller credential; only demo mode accepts the local simulator marker.
+- The edge stores controller identity locally, requires HTTPS and an explicit cached-authorization age in real mode, rejects stale or foreign configuration, and queues events offline. Physical hardware remains disabled.
+- Protocol draft `1.0.0-draft.2` is pinned byte-for-byte across the repositories. All 14 isolated PostgreSQL checks passed against PostgreSQL 17.11 and migrations `001`–`005`; complete the local diff review and create reviewable local commits before moving into the next feature slice.
 
-The three applications already exist as local web prototypes in `smartgate-platform`. They should become usable throughout the next milestones, rather than appearing only after hardware integration. The homeowner portal is designed for a phone browser; a separately installed native app can follow if the pilot shows a need for push notifications or device-specific features.
+## 1. Finish and save the account and app slice
 
-| Application                                    | Current prototype                                                                  | First usable release                                                                                                              | Required before the resident pilot                                                                                                                                     |
-| ---------------------------------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| HOA and company administration (`control-web`) | Demonstration enrollment, credential status, access events, and configuration view | Real HOA administrator login; properties, residents, vehicles, and tag enrollment; suspend or replace a tag; scoped audit history | Gate and controller health, configuration acknowledgement, staff roles, incident review, and a company operations view across only its authorized customer sites       |
-| Homeowner portal (`resident-web`)              | Demonstration vehicle, tag status, activity, and lost-tag report                   | Homeowner login tied to a household; own vehicles and tag status; lost-tag report and correction request                          | Clear request status, readable access history under HOA privacy policy, and mobile layout validated with participating households                                      |
-| Security guard station (`guard-web`)           | Local simulator controls and recent decisions served by the edge                   | Named guard login and assigned gate; live read/decision feed; credential and vehicle lookup; clear denial reasons                 | Shift handover, incident notes, controlled manual assistance with a reason and audit trail, device/sync status, and an offline workflow verified on the actual station |
+**Owner: platform. Invitation browser acceptance remains the immediate verification gate; the PostgreSQL and commit steps are complete.**
 
-The platform controls user roles and records. The edge serves the guard station locally and continues local authorization during internet loss. A guard's manual action must have explicit authority and must respect the barrier's independent safety hardware. Visitor invitations and QR passes are a later release in Step 8.
+- Signed-in invitation acceptance is implemented. Walk through a new HOA administrator, guard, and homeowner plus an existing user accepting a second-village invitation. Preserve evidence that invitation context survives password and MFA sign-in.
+- Walk through first-time HOA administrator, guard, and homeowner invitations; existing-account acceptance; revoked-member rejoining; and switching between two organizations. Ensure each app opens in the correct role and organization after acceptance.
+- The PostgreSQL migration and restore rehearsal with migrations `001` through `005` has passed, including an application role that cannot change the schema. Repeat the relevant test suite after any changes made during diff review.
+- The platform implementation, migration, and documentation are committed together. Keep runtime data and credentials out of Git. Choose GitHub owner and visibility before adding remotes or publishing.
 
-## 1. Save the current baseline
+**Acceptance gate:** all three account journeys work through the web apps; existing accounts cannot be claimed by an invitation token alone; the final schema works on PostgreSQL and restores correctly; platform and edge changes have reviewable local commits.
 
-**Repositories: both.**
+## 2. Give each controller its own identity and scope
 
-- Review the initial source trees and create a baseline commit in each repository.
-- Confirm the GitHub owner and repository visibility before creating or connecting remotes.
-- Publish the two repositories when authorized and run their independent CI workflows.
-- Record the matching draft protocol manifests and the current validation results.
+**Owners: platform and edge. Core software is implemented; joint deployment verification remains.**
 
-**Complete when:** both repositories have a recoverable baseline, runtime data and credentials are excluded, and the first change can be reviewed independently. The current files are still uncommitted local work.
+1. Model the real HOA, site, gate, lane, controller, and installation relationships. Add an authorized company/HOA setup flow for creating and assigning them. Keep household data out of the company fleet view by default.
+2. Issue one-time enrollment material for a specific installation and give each controller a unique, renewable credential. Record who enrolled it, when, its assigned lanes, and its last acknowledged configuration version.
+3. Bind configuration downloads, heartbeats, and event uploads to the enrolled controller identity. Remove the shared simulator token and fixed IDs from the operational path; reject cross-organization and cross-lane claims. Retain a separate development simulator mode.
+4. Define what revocation does while the edge is offline, when cached permissions expire, how a replacement controller inherits a site, and how queued events remain attributable. Carry those choices in the versioned platform-to-edge protocol.
+5. Add controller status and configuration-delivery views to HOA/company administration and the assigned guard station. Use authenticated, encrypted transport in the deployment design.
 
-## 2. Build real authentication and tenant membership
+**Acceptance gate:** two controllers in different villages can enroll and synchronize independently; a stolen or revoked controller credential cannot access another site; an offline controller follows a documented cached-policy rule; event replay stays idempotent.
 
-**Repository: smartgate-platform. Start the first usable version of all three apps here.**
+## 3. Connect one real Hikvision lane
 
-- Select a maintained authentication implementation that supports the required sessions, invitations, and MFA; document that choice before integration.
-- Replace automatic demo profile selection with login, logout, session expiry/revocation, and administrator-issued invitations.
-- Add real users and organization memberships. Derive organization scope from authenticated membership rather than the current fixed demonstration identity.
-- Establish permission templates for platform administrator, HOA administrator, guard, and resident. Require MFA for privileged accounts before real deployments.
-- Bind residents to their authorized property memberships and guards to their assigned sites. Keep platform support access explicit and audited.
-- Separate seed/demo mode from the application used for real accounts. Configure the first account through an operator-controlled setup process.
-- Replace the demo selectors in all three apps with role-specific login and account states. Give HOA staff an actual enrollment and suspension path, homeowners access to their own household and requests, and guards access only to their assigned station.
+**Owner: edge, with an installer and bench equipment. Discovery starts alongside Step 2.**
 
-**Complete when:** two test HOAs can use the system simultaneously; a resident sees only authorized household data; guards cannot perform HOA administration; removing membership or revoking a session removes access. Demonstration shortcuts must not be reachable in the deployable configuration.
+Target the DS-TRI900-1/A reader, DS-TME200 controller line, DS-TMG320 barrier series, and DS-TMG035 radar series. Confirm the exact regional models, firmware, local interface, wiring, tag frequency, and safety inputs before purchasing or writing a transport-specific driver. Obtain sample reader events, EPC/Wiegand mapping, command acknowledgement or isolated I/O details, and an installer-approved wiring diagram.
 
-**Reviewable outputs:** an authentication decision, schema migration, login/invitation screens, working HOA/homeowner/guard journeys, server-side authorization, and focused session/tenant checks.
+Then implement the selected reader, barrier, and detector adapters behind the existing Go interfaces. Verify that SmartGate's local decision is authoritative and no independent allowlist opens the barrier. Keep radar and barrier safety functions independent of cloud availability. The guard station must show observed lane state and failed commands, not merely a requested opening.
 
-## 3. Verify the real PostgreSQL path
+**Acceptance gate:** on supervised hardware, an authorized tag opens the boom, a denied tag does not request an opening, passage is recorded only from an independent observation, and power, detector, obstruction, and manual-release behavior match the approved operating procedure.
 
-**Repository: smartgate-platform. Schedule this with the authentication work.**
+## 4. Finish the three operating dashboards before expanding the pilot
 
-- Run migrations and integration tests against a separate PostgreSQL service, including concurrent enrollment and duplicate event delivery.
-- Introduce a tracked migration runner and separate application/migration database privileges.
-- Establish a local backup-and-restore rehearsal before adding real resident information.
+Build these workflows while Steps 2 and 3 advance; do not wait until hardware integration ends.
 
-**Complete when:** the application passes its integration checks on PostgreSQL, and a restored database preserves memberships, configuration versions, and events. The current successful database checks used PGlite; they do not establish this deployment result.
+| App                                                     | Pilot-critical work                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| HOA and company administration (`control-web`)          | Reuse existing properties for multiple vehicles; manage moves, sales, lost/replacement tags, lane policy, staff access, gate sync, and incident review. Give company operators a scoped fleet/support view without automatic household access.                               |
+| Homeowner portal (`resident-web`)                       | Show the household's vehicles, tags, gate-delivery status, loss/correction requests, and request resolution. Keep the phone-browser layout and define who may see movement history.                                                                                          |
+| Guard station (`guard-web`, served locally by the edge) | Provide named shift sessions, assigned lane status, live reads and clear denial reasons, incident notes, and an authorized manual-assistance flow with a reason and audit record. Prove local authentication, HTTPS, cold start, and offline behavior on the actual station. |
 
-## 4. Replace the demonstration device identity
+**Acceptance gate:** HOA staff, a homeowner, and a guard can each complete their part of a failed-tag, different-car, move-out, and internet-outage scenario. A manual barrier action is attributable and obeys the physical safety system.
 
-**Repositories: platform and edge, with separately reviewed changes.**
+## 5. Run one supervised resident pilot
 
-- Add actual site, gate, lane, and controller enrollment records.
-- Implement a short-lived, single-use enrollment exchange and unique controller credentials, scoped to one organization and installation.
-- Remove the shared simulator bearer marker and hard-coded organization/site/device IDs from the operational path.
-- Use authenticated, encrypted communication. Add MQTT notifications and scoped broker permissions while retaining explicit configuration versions and acknowledgements.
-- Define credential renewal, device revocation, controller replacement, stale-configuration behavior, and recovery after interrupted synchronization.
-- Publish the reviewed protocol bundle and pin it explicitly in the edge repository.
-- Show enrollment, last contact, configuration version, and acknowledgement in the HOA/company dashboard. Show local controller and synchronization state at the guard station.
+Agree with one HOA and installer on the lane, participating households, operating hours, manual fallback, support contacts, privacy notice, retention, and success measures. Commission the barrier and safety devices; rehearse controller replacement, queued-event recovery, database restore, signed update rollback, emergency access, and power-loss behavior. Measure read success, assistance rate, local decision latency, and synchronization age before wider enrollment.
 
-**Complete when:** a controller can enroll once, access only its assigned configuration, reconnect after an outage, and upload queued events without duplicates. Revoking its identity must prevent new cloud access; the separate effect on already-cached local permissions must be documented.
+**Acceptance gate:** installer, HOA, and SmartGate operators sign off on the physical lane and its operating procedure. Simulator results and software builds alone do not satisfy this gate.
 
-## 5. Confirm and build the first Hikvision transport
+## After the resident pilot
 
-**Start the discovery now. Repository for the driver: smartgate-edge.**
+Add visitor invitations and QR passes with expiry, one-time redemption, cancellation, and offline rules. Expand to more lanes and villages only after the first site's results are acceptable. A separately installed homeowner mobile app, cameras, ANPR, billing, and more hardware vendors should follow demonstrated demand.
 
-Keep the selected target: DS-TRI900-1/A reader, DS-TME200 controller line, DS-TMG320 barrier series, and DS-TMG035 radar series. Exact regional SKUs and firmware remain open.
-
-| Input needed                                                             | Decision it enables                            |
-| ------------------------------------------------------------------------ | ---------------------------------------------- |
-| Exact reader/controller model and firmware                               | Which local integration interface is available |
-| Controller protocol/SDK documentation and sample reader events           | A real reader-event adapter                    |
-| Confirmed EPC or Wiegand mapping                                         | Correct enrollment and identity comparison     |
-| Command/acknowledgement documentation or selected isolated I/O interface | A real barrier-control adapter                 |
-| Installer wiring and safety diagram                                      | Safe actuation, feedback, and failure behavior |
-| Bench equipment or a supervised test lane                                | Evidence that the integration works physically |
-
-Resolve whether the controller can leave authorization to SmartGate without independently granting access from a conflicting allowlist. General Hikvision ISAPI support is not sufficient evidence for the exact selected controller.
-
-Once the interface is confirmed, connect the existing reader, barrier, and detector abstractions to it. Extend the draft protocol deliberately to represent physical command outcomes and independently observed passage. Keep HikCentral optional.
-
-Connect real reader events and barrier feedback to the guard station. The operator must see the current lane state and any failed command; a manual opening workflow needs a named, authorized guard, a recorded reason, and installer-approved safety behavior.
-
-**Complete when:** a real tag produces a local decision; a permitted test vehicle receives an observed barrier response; passage is recorded only when independently detected; denied credentials do not produce an opening request. Installer-supervised fault and manual-operation checks are part of this milestone.
-
-Adapter development can begin as soon as the documents and equipment are available. The dashboards and adapter can advance together.
-
-## 6. Finish the app workflows for the pilot
-
-**Repository: platform, with edge changes for local guard operation.**
-
-- Support multiple vehicles per existing property, dated ownership/tenancy, move-outs, vehicle sales, and tag replacement without destroying history.
-- Add enrollment review, lost-tag replacement, and a clear view of which gates have applied each change to the HOA dashboard. Give company operators a scoped fleet view for support and maintenance without broad access to household data.
-- Implement named guard sessions, shift handover, authorized overrides with reasons, and incident records.
-- Define offline guard authentication and revocation limits. Validate local HTTPS and cold-start behavior on the actual guard device.
-- Let homeowners view vehicles, check tag status, request corrections, report loss, and track each request to resolution. Apply explicit permissions to movement history and notifications.
-
-**Complete when:** HOA staff, homeowners, and guards can handle a resident in a different car, a failed tag, a move-out, and a network outage using their respective apps and documented workflows. Historical activity remains attributed to the correct vehicle and occupancy period.
-
-## 7. Prepare one supervised resident pilot
-
-**Repositories: both; installer and HOA participation required.**
-
-- Complete physical safety commissioning, including detection faults, nearby-lane reads, stalled movement, manual release, emergency access, and the selected power-loss behavior.
-- Rehearse controller replacement, queued-event recovery, database restoration, and a signed software update with rollback.
-- Establish monitoring, escalation contacts, spare equipment, support responsibilities, privacy notices, and data retention.
-- Cost the installation and recurring support. Agree on the pilot's operating hours, participating households, success measures, and manual fallback.
-- Measure read success, manual assistance, decision latency, queue delay, and synchronization age against an agreed baseline.
-
-**Complete when:** the software, installer, and HOA acceptance checks pass and the site has an approved operating procedure. A successful simulation or Linux build cannot substitute for physical commissioning.
-
-A limited resident RFID pilot can precede visitor QR if the HOA has an agreed existing visitor procedure. Resident enrollment should expand only after the initial supervised group produces acceptable results.
-
-## 8. Add the visitor experience and expand gradually
-
-- Add resident-issued invitations with validity windows and clear entry, exit, and re-entry rules.
-- Initially bind a one-time entry pass to one gate authority with durable redemption state. Define the behavior during disconnection, cancellation, and controller replacement.
-- Add the necessary privacy controls, resident notifications, and visitor assistance workflow.
-- Extend the pilot after visitor replay and outage cases pass.
-
-Native mobile apps, cameras, ANPR, additional hardware vendors, automated billing, and a separate infrastructure repository remain later work driven by demonstrated demand.
-
-## Recommended starting order
-
-**Baseline → real login and first usable version of all three apps, alongside PostgreSQL verification → enrolled device identity and live device views → real Hikvision gate and guard workflow → finish pilot app workflows → supervised pilot → visitor expansion.**
-
-The immediate software deliverable is Step 2. In parallel, the most useful hardware deliverable is the exact controller manual/SDK and a confirmed test installation from Step 5. A reliable calendar estimate for physical integration should follow those inputs.
+**Immediate order:** walk the invitation acceptance matrix in the browser → verify platform-to-edge enrollment/configuration/event sync together → finish dated occupancy, replacement requests, and offline guard sessions → obtain exact Hikvision SKU/protocol/wiring evidence → commission a supervised lane and rehearse the resident pilot.
