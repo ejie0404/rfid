@@ -23,9 +23,22 @@ const call = (method, url, body, token) =>
 async function seedVehicle(organization, property, plate, value) {
   const vehicle = randomUUID(),
     credential = randomUUID();
+  let occupancy = (
+    await store.query(
+      "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL",
+      [organization, property],
+    )
+  ).rows[0];
+  if (!occupancy) {
+    occupancy = { id: randomUUID() };
+    await store.query(
+      "INSERT INTO property_occupancies(id,organization_id,property_id,started_at,resident_name_at_start) VALUES($1,$2,$3,now(),'Invitee')",
+      [occupancy.id, organization, property],
+    );
+  }
   await store.query(
-    "INSERT INTO vehicles(id,organization_id,property_id,plate,make,color) VALUES($1,$2,$3,$4,'Toyota','White')",
-    [vehicle, organization, property, plate],
+    "INSERT INTO vehicles(id,organization_id,property_id,occupancy_id,plate,make,color) VALUES($1,$2,$3,$4,$5,'Toyota','White')",
+    [vehicle, organization, property, occupancy.id, plate],
   );
   await store.query(
     "INSERT INTO credentials(id,organization_id,format,value,status,valid_from) VALUES($1,$2,'epc',$3,'active',now())",
@@ -785,9 +798,15 @@ test("a guard's data is limited to the assigned station and fails closed without
   await recordEvent(myLane, "AAAA1111");
   await recordEvent(otherLane, "BBBB2222");
   // A vehicle with no credential can never be authorized, so a station need not see it.
+  const occupancy = (
+    await store.query(
+      "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL",
+      [state.orgA, state.propertyA1],
+    )
+  ).rows[0];
   await store.query(
-    "INSERT INTO vehicles(id,organization_id,property_id,plate,make,color) VALUES($1,$2,$3,'ZZZ 9999','Kia','Red')",
-    [randomUUID(), state.orgA, state.propertyA1],
+    "INSERT INTO vehicles(id,organization_id,property_id,occupancy_id,plate,make,color) VALUES($1,$2,$3,$4,'ZZZ 9999','Kia','Red')",
+    [randomUUID(), state.orgA, state.propertyA1, occupancy.id],
   );
 
   const guard = await inviteAndAccept(

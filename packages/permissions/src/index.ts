@@ -10,6 +10,8 @@ export type Permission =
   | "enrollment.write"
   | "credential.manage"
   | "credential.report_lost"
+  | "vehicle.change.request"
+  | "vehicle.retire.request"
   | "vehicle.read"
   | "access.read"
   | "audit.read"
@@ -69,7 +71,13 @@ const templates: Record<Role, readonly Permission[]> = {
     "site.manage",
   ],
   guard: ["vehicle.read", "access.read", "device.read", "site.read"],
-  resident: ["vehicle.read", "access.read", "credential.report_lost"],
+  resident: [
+    "vehicle.read",
+    "access.read",
+    "credential.report_lost",
+    "vehicle.change.request",
+    "vehicle.retire.request",
+  ],
   unaffiliated: [],
 };
 export function can(role: Role, permission: Permission): boolean {

@@ -25,6 +25,15 @@ export type Result = { rows: any[] };
 export type Query = (sql: string, values?: any[]) => Promise<Result>;
 /** A transaction handle. Multi-statement SQL needs `exec`; parameterized SQL uses the call itself. */
 export type Tx = Query & { exec: (sql: string) => Promise<void> };
+type DeliveryCounts = { expected_controllers: number; acknowledged_controllers: number };
+type DueMoveOut = {
+  id: string;
+  organization_id: string;
+  property_id: string;
+  occupancy_id: string;
+};
+type PageResult<T> = { items: T[]; next_cursor: string | null; has_more: boolean; limit: number };
+type CursorPayload = { scope: string; values: string[] };
 export interface StartOptions {
   test?: boolean;
   demo?: boolean;
@@ -166,6 +175,83 @@ export class Store {
     await this.pool?.end();
   }
   /**
+   * Process due schedules from durable database state. Each move-out re-locks the property,
+   * occupancy, and schedule and checks the expected occupancy ID, so multiple API workers and
+   * process restarts safely converge on one close operation.
+   */
+  async processDueScheduledMoveOuts(limit = 20) {
+    const due = (
+      await this.query(
+        `SELECT s.id,s.organization_id,s.property_id,s.occupancy_id
+         FROM scheduled_move_outs s
+         JOIN property_occupancies o
+           ON o.id=s.occupancy_id AND o.organization_id=s.organization_id
+         WHERE s.status='scheduled' AND s.effective_at<=clock_timestamp()
+           AND COALESCE(s.next_attempt_at,s.effective_at)<=clock_timestamp()
+           AND o.ended_at IS NULL
+         ORDER BY COALESCE(s.next_attempt_at,s.effective_at),s.effective_at,s.id LIMIT $1`,
+        [Math.max(1, Math.min(100, Math.floor(limit)))],
+      )
+    ).rows as DueMoveOut[];
+    const results: Array<{
+      schedule_id: string;
+      status: string;
+      error?: string;
+      retry_at?: string;
+    }> = [];
+    for (const schedule of due) {
+      try {
+        const principal: Principal = {
+          id: "system:scheduled-move-out",
+          name: "Scheduled move-out processor",
+          email: "system@smartgate.invalid",
+          role: "hoa_admin",
+          sessionId: "system:scheduled-move-out",
+          organizationId: schedule.organization_id,
+          membershipId: null,
+          properties: [],
+          sites: [],
+          mfaSatisfied: true,
+        };
+        const result = await this.moveOut(principal, schedule.property_id, "", {
+          scheduleId: schedule.id,
+          expectedOccupancyId: schedule.occupancy_id,
+        });
+        results.push({ schedule_id: schedule.id, status: result.status });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "Unknown processing error";
+        const retry = await this.recordScheduledMoveOutFailure(schedule.id, message);
+        results.push({
+          schedule_id: schedule.id,
+          status: "failed",
+          error: message,
+          retry_at: retry?.next_attempt_at
+            ? new Date(retry.next_attempt_at).toISOString()
+            : undefined,
+        });
+      }
+    }
+    return results;
+  }
+  private async recordScheduledMoveOutFailure(scheduleId: string, message: string) {
+    try {
+      return (
+        await this.query(
+          `UPDATE scheduled_move_outs
+           SET retry_count=retry_count+1,last_attempt_at=clock_timestamp(),
+               next_attempt_at=clock_timestamp()+make_interval(
+                 secs=>LEAST(300,5*power(2,LEAST(retry_count,6)))),
+               last_processing_error=$2,updated_at=clock_timestamp()
+           WHERE id=$1 AND status='scheduled'
+           RETURNING retry_count,next_attempt_at`,
+          [scheduleId, message.slice(0, 1000)],
+        )
+      ).rows[0];
+    } catch {
+      return undefined;
+    }
+  }
+  /**
    * Demonstration data only. It is created through the same identity tables the real path uses,
    * so the demonstration exercises real sessions and membership scoping rather than bypassing it.
    */
@@ -196,6 +282,19 @@ export class Store {
         "INSERT INTO properties(id,organization_id,label,resident_name) VALUES($1,$2,'Lot 12 · Acacia Street','Andrea Santos') ON CONFLICT DO NOTHING",
         [IDS.property, IDS.organization],
       );
+      let occupancyId = (
+        await q(
+          "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL",
+          [IDS.organization, IDS.property],
+        )
+      ).rows[0]?.id;
+      if (!occupancyId) {
+        occupancyId = randomUUID();
+        await q(
+          "INSERT INTO property_occupancies(id,organization_id,property_id,started_at,resident_name_at_start) VALUES($1,$2,$3,now(),'Andrea Santos')",
+          [occupancyId, IDS.organization, IDS.property],
+        );
+      }
       const existing = await q("SELECT id FROM users WHERE id=$1", [demoUserIds.admin]);
       if (!existing.rows.length) {
         const password = await hashPassword(DEMO_PASSWORD);
@@ -232,8 +331,8 @@ export class Store {
             );
           if (role === "resident")
             await q(
-              "INSERT INTO property_memberships(id,organization_id,property_id,membership_id,relationship,is_primary_contact) VALUES($1,$2,$3,$4,'owner',true)",
-              [randomUUID(), organizationId, IDS.property, row.id],
+              "INSERT INTO property_memberships(id,organization_id,property_id,membership_id,occupancy_id,relationship,is_primary_contact) VALUES($1,$2,$3,$4,$5,'owner',true)",
+              [randomUUID(), organizationId, IDS.property, row.id, occupancyId],
             );
         }
       }
@@ -244,8 +343,8 @@ export class Store {
         const vehicle = randomUUID(),
           credential = randomUUID();
         await q(
-          "INSERT INTO vehicles(id,organization_id,property_id,plate,make,color) VALUES($1,$2,$3,'NCR 2048','Toyota Fortuner','Pearl white')",
-          [vehicle, IDS.organization, IDS.property],
+          "INSERT INTO vehicles(id,organization_id,property_id,occupancy_id,plate,make,color) VALUES($1,$2,$3,$4,'NCR 2048','Toyota Fortuner','Pearl white')",
+          [vehicle, IDS.organization, IDS.property, occupancyId],
         );
         await q(
           "INSERT INTO credentials(id,organization_id,format,value,status,valid_from) VALUES($1,$2,'epc','E2000017221101441890ABCD','active','2020-01-01T00:00:00Z')",
@@ -417,6 +516,58 @@ export class Store {
           "INSERT INTO controller_lanes(organization_id,controller_id,lane_id) VALUES($1,$2,$3)",
           [grant.organization_id, controllerId, laneId],
         );
+      const currentConfigVersion = Number(
+        (
+          await q("SELECT config_version FROM organizations WHERE id=$1 FOR SHARE", [
+            grant.organization_id,
+          ])
+        ).rows[0].config_version,
+      );
+      const schedules = (
+        await q(
+          `SELECT s.id,s.revision,s.occupancy_id
+           FROM scheduled_move_outs s
+           WHERE s.organization_id=$1 AND s.status='scheduled'
+             AND EXISTS (
+               SELECT 1 FROM vehicles v
+               JOIN assignments a ON a.vehicle_id=v.id AND a.organization_id=v.organization_id
+                 AND a.ended_at IS NULL
+               JOIN credentials credential
+                 ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+               WHERE v.organization_id=s.organization_id AND v.occupancy_id=s.occupancy_id
+                 AND v.active AND EXISTS (
+                   SELECT 1 FROM controller_lanes cl
+                   WHERE cl.organization_id=$1 AND cl.controller_id=$2
+                     AND (NOT EXISTS (
+                       SELECT 1 FROM credential_lanes policy
+                       WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                     ) OR EXISTS (
+                       SELECT 1 FROM credential_lanes policy
+                       WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                         AND policy.lane_id=cl.lane_id
+                     ))
+                 )
+             )`,
+          [grant.organization_id, controllerId],
+        )
+      ).rows;
+      for (const schedule of schedules)
+        await q(
+          `INSERT INTO scheduled_move_out_controller_targets(
+             organization_id,schedule_id,revision,controller_id,configuration_version
+           ) VALUES($1,$2,$3,$4,$5)
+           ON CONFLICT(organization_id,schedule_id,revision,controller_id)
+           DO UPDATE SET configuration_version=GREATEST(
+             scheduled_move_out_controller_targets.configuration_version,EXCLUDED.configuration_version
+           )`,
+          [
+            grant.organization_id,
+            schedule.id,
+            schedule.revision,
+            controllerId,
+            currentConfigVersion,
+          ],
+        );
       await q("UPDATE controller_enrollment_grants SET consumed_at=now() WHERE id=$1", [grant.id]);
       await q(
         "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail) VALUES($1,$2,$3,'controller.enrolled',$4,$5)",
@@ -507,6 +658,386 @@ export class Store {
     });
     return { controller_id: id, credential };
   }
+  private pageScope(p: Principal, filters: Record<string, unknown>) {
+    return createHash("sha256")
+      .update(
+        JSON.stringify({
+          organization_id: p.organizationId,
+          actor_id: p.id,
+          role: p.role,
+          ...filters,
+        }),
+      )
+      .digest("hex");
+  }
+
+  private readPageCursor(
+    cursor: string | undefined,
+    scope: string,
+    count: number,
+  ): string[] | null {
+    if (!cursor) return null;
+    try {
+      const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as CursorPayload;
+      if (
+        parsed.scope !== scope ||
+        !Array.isArray(parsed.values) ||
+        parsed.values.length !== count ||
+        parsed.values.some((value) => typeof value !== "string")
+      )
+        throw new Error("scope");
+      return parsed.values;
+    } catch {
+      throw new BadRequestException("This page cursor is invalid or belongs to different filters.");
+    }
+  }
+
+  private createPage<T extends { __cursor_values: string[] }>(
+    rows: T[],
+    limit: number,
+    scope: string,
+  ): PageResult<Omit<T, "__cursor_values">> {
+    const hasMore = rows.length > limit;
+    const visible = rows.slice(0, limit);
+    const last = visible.at(-1);
+    return {
+      items: visible.map(({ __cursor_values: _cursor, ...item }) => item),
+      next_cursor:
+        hasMore && last
+          ? Buffer.from(JSON.stringify({ scope, values: last.__cursor_values }), "utf8").toString(
+              "base64url",
+            )
+          : null,
+      has_more: hasMore,
+      limit,
+    };
+  }
+
+  private checkedPageLimit(input?: number) {
+    const limit = input ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100)
+      throw new BadRequestException("Page size must be between 1 and 100.");
+    return limit;
+  }
+
+  async pageHouseholds(
+    p: Principal,
+    filters: { search?: string; cursor?: string; limit?: number } = {},
+  ): Promise<PageResult<any>> {
+    if (!p.organizationId || !(p.role === "hoa_admin" || p.role === "resident" || p.supportGrantId))
+      throw new ForbiddenException("Household access is not available to this role.");
+    const limit = this.checkedPageLimit(filters.limit);
+    const search = (filters.search ?? "").trim().slice(0, 120).toLocaleLowerCase();
+    const scope = this.pageScope(p, { kind: "households", search });
+    const cursor = this.readPageCursor(filters.cursor, scope, 2);
+    const values: any[] = [p.organizationId];
+    const clauses = ["p.organization_id=$1"];
+    if (p.role === "resident") {
+      values.push(p.properties);
+      clauses.push(`p.id=ANY($${values.length}::uuid[])`);
+    }
+    if (search) {
+      values.push(search);
+      clauses.push(
+        `(lower(p.label) LIKE $${values.length} || '%' OR lower(p.resident_name) LIKE $${values.length} || '%')`,
+      );
+    }
+    if (cursor) {
+      values.push(cursor[0], cursor[1]);
+      clauses.push(`(lower(p.label),p.id)>($${values.length - 1},$${values.length}::uuid)`);
+    }
+    values.push(limit + 1);
+    const rows = (
+      await this.query(
+        `SELECT p.id,p.label,p.resident_name,o.id AS occupancy_id,o.started_at AS occupancy_started_at,
+                s.id AS scheduled_move_out_id,s.effective_at AS scheduled_move_out_at,
+                s.revision AS scheduled_move_out_revision,
+                (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                 JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                 WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                   AND t.revision=s.revision AND c.status='active') AS scheduled_expected_controllers,
+                (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                 JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                 WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                   AND t.revision=s.revision AND c.status='active'
+                   AND c.config_version>=t.configuration_version) AS scheduled_acknowledged_controllers,
+                ARRAY[lower(p.label),p.id::text] AS __cursor_values
+         FROM properties p
+         LEFT JOIN property_occupancies o
+           ON o.organization_id=p.organization_id AND o.property_id=p.id AND o.ended_at IS NULL
+         LEFT JOIN scheduled_move_outs s
+           ON s.organization_id=o.organization_id AND s.occupancy_id=o.id AND s.status='scheduled'
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY lower(p.label),p.id LIMIT $${values.length}`,
+        values,
+      )
+    ).rows;
+    return this.createPage(rows, limit, scope);
+  }
+
+  async pageHouseholdMembers(
+    p: Principal,
+    propertyId: string,
+    filters: { cursor?: string; limit?: number; status?: "active" | "ended" } = {},
+  ): Promise<PageResult<any>> {
+    if (!p.organizationId || (p.role !== "hoa_admin" && !p.supportGrantId))
+      throw new ForbiddenException("Village administrator permission is required.");
+    const limit = this.checkedPageLimit(filters.limit);
+    const scope = this.pageScope(p, {
+      kind: "household_members",
+      property_id: propertyId,
+      status: filters.status ?? "all",
+    });
+    const cursor = this.readPageCursor(filters.cursor, scope, 3);
+    const values: any[] = [p.organizationId, propertyId];
+    const clauses = ["pm.organization_id=$1", "pm.property_id=$2"];
+    if (filters.status === "active") clauses.push("pm.ended_at IS NULL");
+    if (filters.status === "ended") clauses.push("pm.ended_at IS NOT NULL");
+    if (cursor) {
+      values.push(cursor[0], cursor[1], cursor[2]);
+      const ended = "(pm.ended_at IS NOT NULL)";
+      clauses.push(
+        `(${ended}>$${values.length - 2}::boolean OR (${ended}=$${values.length - 2}::boolean AND (pm.started_at,pm.id)<($${values.length - 1}::timestamptz,$${values.length}::uuid)))`,
+      );
+    }
+    values.push(limit + 1);
+    const rows = (
+      await this.query(
+        `SELECT pm.id,pm.property_id,pm.occupancy_id,pm.relationship,
+                pm.is_primary_contact,pm.started_at,pm.ended_at,
+                u.name,u.email,m.status AS membership_status,
+                ARRAY[(pm.ended_at IS NOT NULL)::text,pm.started_at::text,pm.id::text] AS __cursor_values
+         FROM property_memberships pm
+         JOIN organization_memberships m ON m.id=pm.membership_id
+         JOIN users u ON u.id=m.user_id
+         WHERE ${clauses.join(" AND ")}
+          ORDER BY (pm.ended_at IS NOT NULL) ASC,pm.started_at DESC,pm.id DESC LIMIT $${values.length}`,
+        values,
+      )
+    ).rows;
+    return this.createPage(rows, limit, scope);
+  }
+
+  async pageOccupancies(
+    p: Principal,
+    filters: {
+      propertyId?: string;
+      status?: "active" | "ended";
+      cursor?: string;
+      limit?: number;
+    } = {},
+  ): Promise<PageResult<any>> {
+    if (!p.organizationId || (p.role !== "hoa_admin" && !p.supportGrantId))
+      throw new ForbiddenException("Village administrator permission is required.");
+    const limit = this.checkedPageLimit(filters.limit);
+    const scope = this.pageScope(p, {
+      kind: "occupancies",
+      property_id: filters.propertyId ?? "",
+      status: filters.status ?? "all",
+    });
+    const cursor = this.readPageCursor(filters.cursor, scope, 2);
+    const values: any[] = [p.organizationId];
+    const clauses = ["o.organization_id=$1"];
+    if (filters.propertyId) {
+      values.push(filters.propertyId);
+      clauses.push(`o.property_id=$${values.length}`);
+    }
+    if (filters.status === "active") clauses.push("o.ended_at IS NULL");
+    if (filters.status === "ended") clauses.push("o.ended_at IS NOT NULL");
+    if (cursor) {
+      values.push(cursor[0], cursor[1]);
+      clauses.push(
+        `(o.started_at,o.id)<($${values.length - 1}::timestamptz,$${values.length}::uuid)`,
+      );
+    }
+    values.push(limit + 1);
+    const rows = (
+      await this.query(
+        `SELECT o.id,o.property_id,o.started_at,o.ended_at,o.end_reason,o.required_config_version,
+                p.label AS property_label,o.resident_name_at_start AS resident_name,
+                COALESCE((SELECT array_agg(DISTINCT u.name ORDER BY u.name)
+                          FROM property_memberships pm JOIN organization_memberships m ON m.id=pm.membership_id
+                          JOIN users u ON u.id=m.user_id WHERE pm.occupancy_id=o.id),ARRAY[]::text[]) AS occupant_names,
+                (SELECT count(*)::int FROM occupancy_controller_targets t
+                 JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                 WHERE t.organization_id=o.organization_id AND t.occupancy_id=o.id AND c.status='active') AS expected_controllers,
+                (SELECT count(*)::int FROM occupancy_controller_targets t
+                 JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                 WHERE t.organization_id=o.organization_id AND t.occupancy_id=o.id AND c.status='active'
+                   AND o.required_config_version IS NOT NULL AND c.config_version>=o.required_config_version) AS acknowledged_controllers,
+                ARRAY[o.started_at::text,o.id::text] AS __cursor_values
+         FROM property_occupancies o
+         JOIN properties p ON p.id=o.property_id AND p.organization_id=o.organization_id
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY o.started_at DESC,o.id DESC LIMIT $${values.length}`,
+        values,
+      )
+    ).rows;
+    return this.createPage(rows, limit, scope);
+  }
+
+  async pageLifecycleRequests(
+    p: Principal,
+    filters: {
+      kind: "vehicle_changes" | "credential_replacements" | "vehicle_retirements" | "move_outs";
+      status?: string;
+      propertyId?: string;
+      search?: string;
+      cursor?: string;
+      limit?: number;
+    },
+  ): Promise<PageResult<any>> {
+    if (!p.organizationId || !(p.role === "hoa_admin" || p.role === "resident" || p.supportGrantId))
+      throw new ForbiddenException("Lifecycle records are not available to this role.");
+    const specs = {
+      vehicle_changes: {
+        table: "vehicle_change_requests",
+        time: "r.created_at",
+        search: (param: string) =>
+          `(lower(r.prior_plate) LIKE ${param} || '%' OR lower(r.proposed_plate) LIKE ${param} || '%' OR lower(r.proposed_make) LIKE ${param} || '%' OR lower(r.proposed_color) LIKE ${param} || '%' OR lower(p.label) LIKE ${param} || '%' OR lower(p.resident_name) LIKE ${param} || '%')`,
+        select: `r.*,p.label AS property_label,p.resident_name,v.plate AS current_plate,
+          (SELECT count(*)::int FROM vehicle_change_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.request_id=r.id AND c.status='active') AS expected_controllers,
+          (SELECT count(*)::int FROM vehicle_change_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.request_id=r.id AND c.status='active'
+             AND r.required_config_version IS NOT NULL AND c.config_version>=r.required_config_version) AS acknowledged_controllers`,
+        join: "JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id",
+        occupancy: "r.occupancy_id",
+        statuses: ["pending", "approved", "rejected", "cancelled"],
+      },
+      credential_replacements: {
+        table: "credential_replacement_requests",
+        time: "r.created_at",
+        search: (param: string) =>
+          `(lower(v.plate) LIKE ${param} || '%' OR lower(v.make) LIKE ${param} || '%' OR lower(p.label) LIKE ${param} || '%' OR lower(p.resident_name) LIKE ${param} || '%')`,
+        select: `r.*,p.label AS property_label,p.resident_name,v.plate,v.make,v.occupancy_id,
+          (SELECT count(*)::int FROM controllers c WHERE c.organization_id=r.organization_id
+           AND c.status='active' AND (NOT EXISTS (SELECT 1 FROM credential_lanes policy
+             WHERE policy.organization_id=r.organization_id AND policy.credential_id=r.credential_id)
+             OR EXISTS (SELECT 1 FROM credential_lanes policy JOIN controller_lanes assigned
+               ON assigned.organization_id=policy.organization_id AND assigned.lane_id=policy.lane_id
+               WHERE policy.organization_id=r.organization_id AND policy.credential_id=r.credential_id
+                 AND assigned.controller_id=c.id))) AS expected_controllers,
+          (SELECT count(*)::int FROM controllers c WHERE c.organization_id=r.organization_id
+           AND c.status='active' AND c.config_version>=r.required_config_version
+           AND (NOT EXISTS (SELECT 1 FROM credential_lanes policy
+             WHERE policy.organization_id=r.organization_id AND policy.credential_id=r.credential_id)
+             OR EXISTS (SELECT 1 FROM credential_lanes policy JOIN controller_lanes assigned
+               ON assigned.organization_id=policy.organization_id AND assigned.lane_id=policy.lane_id
+               WHERE policy.organization_id=r.organization_id AND policy.credential_id=r.credential_id
+                 AND assigned.controller_id=c.id))) AS acknowledged_controllers`,
+        join: "JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id",
+        occupancy: "v.occupancy_id",
+        statuses: ["pending", "issued", "rejected"],
+      },
+      vehicle_retirements: {
+        table: "vehicle_retirement_requests",
+        time: "r.created_at",
+        search: (param: string) =>
+          `(lower(v.plate) LIKE ${param} || '%' OR lower(v.make) LIKE ${param} || '%' OR lower(p.label) LIKE ${param} || '%' OR lower(p.resident_name) LIKE ${param} || '%' OR lower(r.reason) LIKE ${param} || '%')`,
+        select: `r.*,p.label AS property_label,p.resident_name,v.plate,v.make,v.color,
+          (SELECT count(*)::int FROM vehicle_retirement_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.request_id=r.id AND c.status='active') AS expected_controllers,
+          (SELECT count(*)::int FROM vehicle_retirement_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.request_id=r.id AND c.status='active'
+             AND r.required_config_version IS NOT NULL AND c.config_version>=r.required_config_version) AS acknowledged_controllers`,
+        join: "JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id",
+        occupancy: "r.occupancy_id",
+        statuses: ["pending", "approved", "rejected", "cancelled"],
+      },
+      move_outs: {
+        table: "scheduled_move_outs",
+        time: "r.created_at",
+        search: (param: string) =>
+          `(lower(p.label) LIKE ${param} || '%' OR lower(o.resident_name_at_start) LIKE ${param} || '%' OR lower(r.reason) LIKE ${param} || '%')`,
+        select: `r.*,p.label AS property_label,o.resident_name_at_start AS resident_name,
+          (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.schedule_id=r.id
+             AND t.revision=r.revision AND c.status='active') AS expected_controllers,
+          (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+           JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+           WHERE t.organization_id=r.organization_id AND t.schedule_id=r.id
+             AND t.revision=r.revision AND c.status='active'
+             AND c.config_version>=t.configuration_version) AS acknowledged_controllers`,
+        join: "JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id JOIN property_occupancies o ON o.id=r.occupancy_id AND o.organization_id=r.organization_id",
+        occupancy: "r.occupancy_id",
+        statuses: ["scheduled", "completed", "cancelled"],
+      },
+    } as const;
+    const spec = specs[filters.kind];
+    if (!spec) throw new BadRequestException("Choose a supported lifecycle record type.");
+    const statusFilter =
+      filters.kind === "move_outs" && filters.status === "pending" ? "scheduled" : filters.status;
+    if (
+      statusFilter &&
+      statusFilter !== "resolved" &&
+      !spec.statuses.includes(statusFilter as never)
+    )
+      throw new BadRequestException("That status is not valid for this record type.");
+    const limit = this.checkedPageLimit(filters.limit);
+    const search = (filters.search ?? "").trim().slice(0, 120).toLocaleLowerCase();
+    const propertyId = filters.propertyId ?? "";
+    if (p.role === "resident" && propertyId && !p.properties.includes(propertyId))
+      throw new NotFoundException("Lifecycle records not found.");
+    const scope = this.pageScope(p, {
+      kind: filters.kind,
+      status: statusFilter ?? "all",
+      property_id: propertyId,
+      search,
+    });
+    const cursor = this.readPageCursor(filters.cursor, scope, 2);
+    const values: any[] = [p.organizationId];
+    const clauses = ["r.organization_id=$1"];
+    if (statusFilter === "resolved") {
+      clauses.push(filters.kind === "move_outs" ? "r.status<>'scheduled'" : "r.status<>'pending'");
+    } else if (statusFilter) {
+      values.push(statusFilter);
+      clauses.push(`r.status=$${values.length}`);
+    }
+    if (propertyId) {
+      values.push(propertyId);
+      clauses.push(`r.property_id=$${values.length}`);
+    }
+    if (p.role === "resident") {
+      values.push(p.properties);
+      const propertyArg = `$${values.length}::uuid[]`;
+      values.push(p.membershipId);
+      clauses.push(
+        `r.property_id=ANY(${propertyArg}) AND EXISTS (
+           SELECT 1 FROM property_memberships pm
+           WHERE pm.organization_id=r.organization_id AND pm.occupancy_id=${spec.occupancy}
+             AND pm.membership_id=$${values.length} AND pm.ended_at IS NULL
+         )`,
+      );
+    }
+    if (search) {
+      values.push(search);
+      clauses.push(spec.search(`$${values.length}`));
+    }
+    if (cursor) {
+      values.push(cursor[0], cursor[1]);
+      clauses.push(
+        `(${spec.time},r.id)<($${values.length - 1}::timestamptz,$${values.length}::uuid)`,
+      );
+    }
+    values.push(limit + 1);
+    const rows = (
+      await this.query(
+        `SELECT ${spec.select},ARRAY[${spec.time}::text,r.id::text] AS __cursor_values
+         FROM ${spec.table} r ${spec.join}
+         WHERE ${clauses.join(" AND ")}
+         ORDER BY ${spec.time} DESC,r.id DESC LIMIT $${values.length}`,
+        values,
+      )
+    ).rows;
+    return this.createPage(rows, limit, scope);
+  }
+
   async snapshot(p: Principal) {
     if (!p.organizationId)
       throw new ForbiddenException("Select an organization before reading this data.");
@@ -519,7 +1050,14 @@ export class Store {
         "You are not assigned to a station. Ask an administrator to assign one.",
       );
     // A resident is restricted to the households they hold a membership for.
-    const residentScope = resident ? " AND v.property_id = ANY($2)" : "";
+    const residentScope = resident
+      ? ` AND v.property_id = ANY($2) AND v.active
+          AND EXISTS (SELECT 1 FROM property_memberships pm
+                      WHERE pm.organization_id=v.organization_id
+                        AND pm.property_id=v.property_id
+                        AND pm.occupancy_id=v.occupancy_id
+                        AND pm.membership_id=$3 AND pm.ended_at IS NULL)`
+      : "";
     const args = resident ? [p.organizationId, p.properties] : [p.organizationId];
     const vehicles = resident
       ? (
@@ -529,7 +1067,7 @@ export class Store {
    LEFT JOIN assignments a ON a.vehicle_id=v.id AND a.organization_id=v.organization_id AND a.ended_at IS NULL
    LEFT JOIN credentials c ON c.id=a.credential_id AND c.organization_id=v.organization_id
    WHERE v.organization_id=$1${residentScope} ORDER BY v.plate`,
-            args,
+            [p.organizationId, p.properties, p.membershipId],
           )
         ).rows
       : guard
@@ -543,6 +1081,7 @@ export class Store {
                JOIN assignments a ON a.vehicle_id=v.id AND a.organization_id=v.organization_id AND a.ended_at IS NULL
                JOIN credentials c ON c.id=a.credential_id AND c.organization_id=v.organization_id
                WHERE v.organization_id=$1
+                 AND v.active
                  AND (NOT EXISTS (SELECT 1 FROM credential_lanes cl WHERE cl.credential_id=c.id)
                       OR EXISTS (SELECT 1 FROM credential_lanes cl JOIN lanes l ON l.id=cl.lane_id
                                  WHERE cl.credential_id=c.id AND l.site_id = ANY($2)))
@@ -556,15 +1095,21 @@ export class Store {
    FROM vehicles v JOIN properties p ON p.id=v.property_id AND p.organization_id=v.organization_id
    LEFT JOIN assignments a ON a.vehicle_id=v.id AND a.organization_id=v.organization_id AND a.ended_at IS NULL
    LEFT JOIN credentials c ON c.id=a.credential_id AND c.organization_id=v.organization_id
-   WHERE v.organization_id=$1 ORDER BY v.plate`,
+   WHERE v.organization_id=$1 AND v.active ORDER BY v.plate`,
               [p.organizationId],
             )
           ).rows;
     const events = resident
       ? (
           await this.query(
-            "SELECT e.payload FROM access_events e JOIN vehicles v ON v.id=e.vehicle_id AND v.organization_id=e.organization_id WHERE e.organization_id=$1 AND v.property_id = ANY($2) ORDER BY e.received_at DESC LIMIT 100",
-            args,
+            `SELECT e.payload FROM access_events e
+             JOIN vehicles v ON v.id=e.vehicle_id AND v.organization_id=e.organization_id
+             WHERE e.organization_id=$1 AND v.property_id=ANY($2)
+               AND EXISTS (SELECT 1 FROM property_memberships pm
+                           WHERE pm.occupancy_id=v.occupancy_id
+                             AND pm.membership_id=$3 AND pm.ended_at IS NULL)
+             ORDER BY e.received_at DESC LIMIT 100`,
+            [p.organizationId, p.properties, p.membershipId],
           )
         ).rows
       : guard
@@ -603,7 +1148,24 @@ export class Store {
     const properties = resident
       ? (
           await this.query(
-            "SELECT id,label,resident_name FROM properties WHERE organization_id=$1 AND id = ANY($2) ORDER BY label",
+            `SELECT p.id,p.label,p.resident_name,o.id AS occupancy_id,o.started_at AS occupancy_started_at,
+                    s.id AS scheduled_move_out_id,s.effective_at AS scheduled_move_out_at,
+                    s.revision AS scheduled_move_out_revision,
+                    (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                     JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                     WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                       AND t.revision=s.revision AND c.status='active') AS scheduled_expected_controllers,
+                    (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                     JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                     WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                       AND t.revision=s.revision AND c.status='active'
+                       AND c.config_version>=t.configuration_version) AS scheduled_acknowledged_controllers
+             FROM properties p
+             LEFT JOIN property_occupancies o
+               ON o.organization_id=p.organization_id AND o.property_id=p.id AND o.ended_at IS NULL
+             LEFT JOIN scheduled_move_outs s
+               ON s.organization_id=o.organization_id AND s.occupancy_id=o.id AND s.status='scheduled'
+             WHERE p.organization_id=$1 AND p.id = ANY($2) ORDER BY p.label`,
             args,
           )
         ).rows
@@ -611,7 +1173,24 @@ export class Store {
         ? []
         : (
             await this.query(
-              "SELECT id,label,resident_name FROM properties WHERE organization_id=$1 ORDER BY label",
+              `SELECT p.id,p.label,p.resident_name,o.id AS occupancy_id,o.started_at AS occupancy_started_at,
+                      s.id AS scheduled_move_out_id,s.effective_at AS scheduled_move_out_at,
+                      s.revision AS scheduled_move_out_revision,
+                      (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                         AND t.revision=s.revision AND c.status='active') AS scheduled_expected_controllers,
+                      (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                         AND t.revision=s.revision AND c.status='active'
+                         AND c.config_version>=t.configuration_version) AS scheduled_acknowledged_controllers
+               FROM properties p
+               LEFT JOIN property_occupancies o
+                 ON o.organization_id=p.organization_id AND o.property_id=p.id AND o.ended_at IS NULL
+               LEFT JOIN scheduled_move_outs s
+                 ON s.organization_id=o.organization_id AND s.occupancy_id=o.id AND s.status='scheduled'
+               WHERE p.organization_id=$1 ORDER BY p.label`,
               [p.organizationId],
             )
           ).rows;
@@ -632,11 +1211,188 @@ export class Store {
     ).rows;
     const visibleSites = new Set(sites.map((site) => site.id));
     const lanes = organizationLanes.filter((lane) => visibleSites.has(lane.site_id));
+    const credentialRequests = guard
+      ? []
+      : (
+          await this.query(
+            `SELECT r.id,r.property_id,r.vehicle_id,r.credential_id,r.status,r.created_at,
+                    r.resolved_at,r.required_config_version,r.decision_note,
+                    v.plate,v.make,p.label AS property_label,p.resident_name,
+                    (SELECT count(*)::int FROM controllers c
+                     WHERE c.organization_id=r.organization_id AND c.status='active'
+                       AND (NOT EXISTS (
+                              SELECT 1 FROM credential_lanes policy
+                              WHERE policy.organization_id=r.organization_id
+                                AND policy.credential_id=r.credential_id
+                            ) OR EXISTS (
+                              SELECT 1 FROM credential_lanes policy
+                              JOIN controller_lanes assigned
+                                ON assigned.organization_id=policy.organization_id
+                               AND assigned.lane_id=policy.lane_id
+                              WHERE policy.organization_id=r.organization_id
+                                AND policy.credential_id=r.credential_id
+                                AND assigned.controller_id=c.id
+                            ))) AS expected_controllers,
+                    (SELECT count(*)::int FROM controllers c
+                     WHERE c.organization_id=r.organization_id AND c.status='active'
+                       AND c.config_version>=r.required_config_version
+                       AND (NOT EXISTS (
+                              SELECT 1 FROM credential_lanes policy
+                              WHERE policy.organization_id=r.organization_id
+                                AND policy.credential_id=r.credential_id
+                            ) OR EXISTS (
+                              SELECT 1 FROM credential_lanes policy
+                              JOIN controller_lanes assigned
+                                ON assigned.organization_id=policy.organization_id
+                               AND assigned.lane_id=policy.lane_id
+                              WHERE policy.organization_id=r.organization_id
+                                AND policy.credential_id=r.credential_id
+                                AND assigned.controller_id=c.id
+                            ))) AS acknowledged_controllers
+             FROM credential_replacement_requests r
+             JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id
+             JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id
+             WHERE r.organization_id=$1${resident ? " AND r.property_id = ANY($2) AND EXISTS (SELECT 1 FROM property_memberships pm WHERE pm.membership_id=$3 AND pm.occupancy_id=v.occupancy_id AND pm.ended_at IS NULL)" : ""}
+             ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,r.created_at DESC,r.id DESC LIMIT 100`,
+            resident ? [p.organizationId, p.properties, p.membershipId] : args,
+          )
+        ).rows;
+    const occupancies =
+      resident || guard
+        ? []
+        : (
+            await this.query(
+              `SELECT o.id,o.property_id,o.started_at,o.ended_at,o.end_reason,o.required_config_version,
+                    p.label AS property_label,o.resident_name_at_start AS resident_name,
+                    COALESCE((SELECT array_agg(DISTINCT u.name ORDER BY u.name)
+                              FROM property_memberships pm
+                              JOIN organization_memberships m ON m.id=pm.membership_id
+                              JOIN users u ON u.id=m.user_id
+                              WHERE pm.occupancy_id=o.id),ARRAY[]::text[]) AS occupant_names,
+                    (SELECT count(*)::int FROM occupancy_controller_targets t
+                     JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                     WHERE t.organization_id=o.organization_id AND t.occupancy_id=o.id
+                       AND c.status='active') AS expected_controllers,
+                    (SELECT count(*)::int FROM occupancy_controller_targets t
+                     JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                     WHERE t.organization_id=o.organization_id AND t.occupancy_id=o.id
+                       AND c.status='active' AND o.required_config_version IS NOT NULL
+                       AND c.config_version>=o.required_config_version) AS acknowledged_controllers
+             FROM property_occupancies o
+             JOIN properties p ON p.id=o.property_id AND p.organization_id=o.organization_id
+             WHERE o.organization_id=$1
+             ORDER BY o.started_at DESC LIMIT 200`,
+              [p.organizationId],
+            )
+          ).rows;
+    const propertyMembers =
+      p.role !== "hoa_admin"
+        ? []
+        : (
+            await this.query(
+              `SELECT pm.id,pm.property_id,pm.occupancy_id,pm.relationship,
+                      pm.is_primary_contact,pm.started_at,pm.ended_at,
+                      u.name,u.email,m.status AS membership_status
+               FROM property_memberships pm
+               JOIN organization_memberships m ON m.id=pm.membership_id
+               JOIN users u ON u.id=m.user_id
+               WHERE pm.organization_id=$1
+               ORDER BY pm.ended_at NULLS FIRST,pm.started_at DESC LIMIT 300`,
+              [p.organizationId],
+            )
+          ).rows;
+    const vehicleChanges =
+      guard || (p.role !== "hoa_admin" && !resident)
+        ? []
+        : (
+            await this.query(
+              `SELECT r.id,r.property_id,r.occupancy_id,r.vehicle_id,r.requested_by,
+                      r.prior_plate,r.prior_make,r.prior_color,
+                      r.proposed_plate,r.proposed_make,r.proposed_color,
+                      r.status,r.decision_note,r.required_config_version,
+                      r.created_at,r.resolved_at,p.label AS property_label,
+                      (SELECT count(*)::int FROM vehicle_change_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=r.organization_id AND t.request_id=r.id
+                         AND c.status='active') AS expected_controllers,
+                      (SELECT count(*)::int FROM vehicle_change_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=r.organization_id AND t.request_id=r.id
+                         AND c.status='active' AND r.required_config_version IS NOT NULL
+                         AND c.config_version>=r.required_config_version) AS acknowledged_controllers
+               FROM vehicle_change_requests r
+               JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id
+               WHERE r.organization_id=$1${resident ? " AND r.property_id=ANY($2) AND EXISTS (SELECT 1 FROM property_memberships pm WHERE pm.organization_id=r.organization_id AND pm.occupancy_id=r.occupancy_id AND pm.membership_id=$3 AND pm.ended_at IS NULL)" : ""}
+               ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,
+                        r.created_at DESC LIMIT 100`,
+              resident ? [p.organizationId, p.properties, p.membershipId] : [p.organizationId],
+            )
+          ).rows;
+    const vehicleRetirementRequests =
+      guard || (p.role !== "hoa_admin" && !resident)
+        ? []
+        : (
+            await this.query(
+              `SELECT r.id,r.property_id,r.occupancy_id,r.vehicle_id,r.requested_by,r.source,
+                      r.reason,r.status,r.decision_note,r.required_config_version,
+                      r.created_at,r.resolved_at,v.plate,v.make,p.label AS property_label,
+                      (SELECT count(*)::int FROM vehicle_retirement_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=r.organization_id AND t.request_id=r.id
+                         AND c.status='active') AS expected_controllers,
+                      (SELECT count(*)::int FROM vehicle_retirement_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=r.organization_id AND t.request_id=r.id
+                         AND c.status='active' AND r.required_config_version IS NOT NULL
+                         AND c.config_version>=r.required_config_version) AS acknowledged_controllers
+               FROM vehicle_retirement_requests r
+               JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id
+               JOIN properties p ON p.id=r.property_id AND p.organization_id=r.organization_id
+               WHERE r.organization_id=$1${resident ? " AND r.property_id=ANY($2) AND EXISTS (SELECT 1 FROM property_memberships pm WHERE pm.organization_id=r.organization_id AND pm.occupancy_id=r.occupancy_id AND pm.membership_id=$3 AND pm.ended_at IS NULL)" : ""}
+               ORDER BY CASE WHEN r.status='pending' THEN 0 ELSE 1 END,
+                        r.created_at DESC,r.id DESC LIMIT 100`,
+              resident ? [p.organizationId, p.properties, p.membershipId] : [p.organizationId],
+            )
+          ).rows;
+    const scheduledMoveOuts =
+      guard || (p.role !== "hoa_admin" && !resident)
+        ? []
+        : (
+            await this.query(
+              `SELECT s.id,s.property_id,s.occupancy_id,s.requested_by,s.reason,s.effective_at,
+                      s.retry_count,s.last_attempt_at,s.next_attempt_at,s.last_processing_error,
+                      s.revision,s.configuration_version,s.status,s.created_at,s.updated_at,
+                      s.completed_at,s.cancelled_at,p.label AS property_label,
+                      o.resident_name_at_start AS resident_name,
+                      (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                         AND t.revision=s.revision AND c.status='active') AS expected_controllers,
+                      (SELECT count(*)::int FROM scheduled_move_out_controller_targets t
+                       JOIN controllers c ON c.id=t.controller_id AND c.organization_id=t.organization_id
+                       WHERE t.organization_id=s.organization_id AND t.schedule_id=s.id
+                         AND t.revision=s.revision AND c.status='active'
+                         AND c.config_version>=t.configuration_version) AS acknowledged_controllers
+               FROM scheduled_move_outs s
+               JOIN property_occupancies o ON o.id=s.occupancy_id AND o.organization_id=s.organization_id
+               JOIN properties p ON p.id=s.property_id AND p.organization_id=s.organization_id
+               WHERE s.organization_id=$1${resident ? " AND s.property_id=ANY($2) AND EXISTS (SELECT 1 FROM property_memberships pm WHERE pm.organization_id=s.organization_id AND pm.occupancy_id=s.occupancy_id AND pm.membership_id=$3 AND pm.ended_at IS NULL)" : ""}
+               ORDER BY CASE WHEN s.status='scheduled' THEN 0 ELSE 1 END,
+                        s.effective_at DESC,s.id DESC LIMIT 100`,
+              resident ? [p.organizationId, p.properties, p.membershipId] : [p.organizationId],
+            )
+          ).rows;
     return {
       organization,
       principal: p,
       vehicles,
       events: events.map((r) => r.payload),
+      credential_requests: credentialRequests,
+      vehicle_change_requests: vehicleChanges,
+      vehicle_retirement_requests: vehicleRetirementRequests,
+      scheduled_move_outs: scheduledMoveOuts,
+      property_members: propertyMembers,
+      occupancies,
       heartbeats,
       properties,
       sites,
@@ -732,6 +1488,7 @@ export class Store {
     const vehicle = randomUUID(),
       property = input.propertyId ?? randomUUID(),
       credential = randomUUID();
+    let occupancyId = "";
     try {
       await this.transaction(async (q) => {
         // Gate policy: the listed lanes, or every lane in the village when none are chosen. A
@@ -762,10 +1519,29 @@ export class Store {
             "INSERT INTO properties(id,organization_id,label,resident_name) VALUES($1,$2,$3,$4)",
             [property, p.organizationId, input.property.trim(), input.resident.trim()],
           );
+          occupancyId = randomUUID();
+          await q(
+            "INSERT INTO property_occupancies(id,organization_id,property_id,started_at,resident_name_at_start,created_by) VALUES($1,$2,$3,now(),$4,$5)",
+            [occupancyId, p.organizationId, property, input.resident!.trim(), p.id],
+          );
         }
+        if (input.propertyId) {
+          const currentOccupancy = (
+            await q(
+              "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL FOR UPDATE",
+              [p.organizationId, property],
+            )
+          ).rows[0];
+          if (!currentOccupancy)
+            throw new BadRequestException(
+              "This household has no active occupancy. Invite a resident to start one before enrolling a vehicle.",
+            );
+          occupancyId = currentOccupancy.id;
+        }
+        await this.assertOccupancyBeforeCutoff(q, p.organizationId, occupancyId);
         await q(
-          "INSERT INTO vehicles(id,organization_id,property_id,plate,make,color) VALUES($1,$2,$3,$4,$5,$6)",
-          [vehicle, p.organizationId, property, input.plate, input.make, input.color],
+          "INSERT INTO vehicles(id,organization_id,property_id,occupancy_id,plate,make,color) VALUES($1,$2,$3,$4,$5,$6,$7)",
+          [vehicle, p.organizationId, property, occupancyId, input.plate, input.make, input.color],
         );
         await q(
           "INSERT INTO credentials(id,organization_id,format,value,status,valid_from) VALUES($1,$2,$3,$4,'active',now())",
@@ -780,9 +1556,18 @@ export class Store {
             "INSERT INTO credential_lanes(id,organization_id,credential_id,lane_id) VALUES($1,$2,$3,$4)",
             [randomUUID(), p.organizationId, credential, lane],
           );
-        await q("UPDATE organizations SET config_version=config_version+1 WHERE id=$1", [
-          p.organizationId,
-        ]);
+        const versionRow = (
+          await q(
+            "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+            [p.organizationId],
+          )
+        ).rows[0];
+        await this.refreshScheduledMoveOutTargets(
+          q,
+          p.organizationId!,
+          occupancyId,
+          versionRow.config_version,
+        );
         await q(
           "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.enrolled',$4,$5,$6)",
           [
@@ -807,7 +1592,17 @@ export class Store {
     await this.transaction(async (q) => {
       const rows = (
         await q(
-          "SELECT c.status,v.property_id FROM credentials c JOIN assignments a ON a.credential_id=c.id AND a.organization_id=c.organization_id AND a.ended_at IS NULL JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id WHERE c.id=$1 AND c.organization_id=$2 FOR UPDATE OF c",
+          `SELECT c.status,v.property_id FROM credentials c
+           JOIN assignments a ON a.credential_id=c.id AND a.organization_id=c.organization_id AND a.ended_at IS NULL
+           JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id AND v.active
+           JOIN property_occupancies o ON o.id=v.occupancy_id AND o.organization_id=v.organization_id AND o.ended_at IS NULL
+           WHERE c.id=$1 AND c.organization_id=$2
+             AND NOT EXISTS (
+               SELECT 1 FROM scheduled_move_outs s
+               WHERE s.organization_id=o.organization_id AND s.occupancy_id=o.id
+                AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+             )
+           FOR UPDATE OF c`,
           [id, p.organizationId],
         )
       ).rows;
@@ -841,6 +1636,1706 @@ export class Store {
       );
     });
   }
+  async requestVehicleChange(
+    p: Principal,
+    vehicleId: string,
+    proposed: { plate: string; make: string; color: string },
+  ) {
+    if (!p.organizationId || p.role !== "resident" || !p.membershipId)
+      throw new ForbiddenException("A resident membership is required.");
+    const reference = (
+      await this.query("SELECT property_id FROM vehicles WHERE id=$1 AND organization_id=$2", [
+        vehicleId,
+        p.organizationId,
+      ])
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle not found.");
+    const requestId = randomUUID();
+    try {
+      return await this.transaction(async (q) => {
+        const property = (
+          await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+            reference.property_id,
+            p.organizationId,
+          ])
+        ).rows[0];
+        if (!property) throw new NotFoundException("Vehicle not found.");
+        const vehicle = (
+          await q(
+            `SELECT v.id,v.property_id,v.occupancy_id,v.plate,v.make,v.color
+             FROM vehicles v
+             JOIN property_occupancies o ON o.id=v.occupancy_id AND o.ended_at IS NULL
+             WHERE v.id=$1 AND v.organization_id=$2 AND v.active
+             FOR UPDATE OF v`,
+            [vehicleId, p.organizationId],
+          )
+        ).rows[0];
+        if (!vehicle || vehicle.property_id !== reference.property_id)
+          throw new NotFoundException("Active household vehicle not found.");
+        await this.assertOccupancyBeforeCutoff(q, p.organizationId, vehicle.occupancy_id);
+        const ownsCurrentOccupancy = (
+          await q(
+            `SELECT 1 FROM property_memberships
+             WHERE organization_id=$1 AND property_id=$2 AND occupancy_id=$3
+               AND membership_id=$4 AND ended_at IS NULL`,
+            [p.organizationId, vehicle.property_id, vehicle.occupancy_id, p.membershipId],
+          )
+        ).rows.length;
+        if (!ownsCurrentOccupancy) throw new NotFoundException("Vehicle not found.");
+        if (
+          vehicle.plate === proposed.plate &&
+          vehicle.make === proposed.make &&
+          vehicle.color === proposed.color
+        )
+          throw new BadRequestException("Enter a change to request.");
+        await q(
+          `INSERT INTO vehicle_change_requests(
+             id,organization_id,property_id,occupancy_id,vehicle_id,requested_by,
+             prior_plate,prior_make,prior_color,proposed_plate,proposed_make,proposed_color
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            requestId,
+            p.organizationId,
+            vehicle.property_id,
+            vehicle.occupancy_id,
+            vehicle.id,
+            p.id,
+            vehicle.plate,
+            vehicle.make,
+            vehicle.color,
+            proposed.plate,
+            proposed.make,
+            proposed.color,
+          ],
+        );
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_requested',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            requestId,
+            JSON.stringify({
+              vehicle_id: vehicle.id,
+              occupancy_id: vehicle.occupancy_id,
+              proposed,
+            }),
+            p.supportGrantId ?? null,
+          ],
+        );
+        return { request_id: requestId, status: "pending" };
+      });
+    } catch (error: any) {
+      if (error.code === "23505")
+        throw new BadRequestException("This vehicle already has a pending change request.");
+      throw error;
+    }
+  }
+  async approveVehicleChange(p: Principal, requestId: string, note = "") {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    const reference = (
+      await this.query(
+        "SELECT property_id FROM vehicle_change_requests WHERE id=$1 AND organization_id=$2",
+        [requestId, p.organizationId],
+      )
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle change request not found.");
+    try {
+      return await this.transaction(async (q) => {
+        const property = (
+          await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+            reference.property_id,
+            p.organizationId,
+          ])
+        ).rows[0];
+        if (!property) throw new NotFoundException("Vehicle change request not found.");
+        const request = (
+          await q(
+            `SELECT * FROM vehicle_change_requests
+             WHERE id=$1 AND organization_id=$2 FOR UPDATE`,
+            [requestId, p.organizationId],
+          )
+        ).rows[0];
+        if (!request || request.status !== "pending")
+          throw new BadRequestException("This request is no longer pending.");
+        const requesterStillBelongs = (
+          await q(
+            `SELECT 1 FROM property_memberships pm
+             JOIN organization_memberships membership ON membership.id=pm.membership_id
+             WHERE pm.organization_id=$1 AND pm.property_id=$2 AND pm.occupancy_id=$3
+               AND pm.ended_at IS NULL AND membership.status='active'
+               AND membership.role='resident' AND membership.user_id=$4
+             LIMIT 1`,
+            [p.organizationId, request.property_id, request.occupancy_id, request.requested_by],
+          )
+        ).rows.length;
+        if (!requesterStillBelongs)
+          throw new BadRequestException("The resident no longer belongs to this household.");
+        await this.assertOccupancyBeforeCutoff(q, p.organizationId, request.occupancy_id);
+        const vehicle = (
+          await q(
+            `SELECT v.id,v.occupancy_id,v.plate,v.make,v.color,v.active,o.ended_at
+             FROM vehicles v JOIN property_occupancies o ON o.id=v.occupancy_id
+             WHERE v.id=$1 AND v.organization_id=$2 FOR UPDATE OF v`,
+            [request.vehicle_id, p.organizationId],
+          )
+        ).rows[0];
+        if (
+          !vehicle ||
+          !vehicle.active ||
+          vehicle.ended_at ||
+          vehicle.occupancy_id !== request.occupancy_id
+        )
+          throw new BadRequestException("The household or vehicle is no longer active.");
+        if (
+          vehicle.plate !== request.prior_plate ||
+          vehicle.make !== request.prior_make ||
+          vehicle.color !== request.prior_color
+        )
+          throw new BadRequestException(
+            "Vehicle details changed after this request was submitted.",
+          );
+        const plateChanged = request.proposed_plate !== vehicle.plate;
+        await q(
+          "UPDATE vehicles SET plate=$1,make=$2,color=$3 WHERE id=$4 AND organization_id=$5",
+          [
+            request.proposed_plate,
+            request.proposed_make,
+            request.proposed_color,
+            vehicle.id,
+            p.organizationId,
+          ],
+        );
+        let version: number | null = null;
+        let targetCount = 0;
+        if (plateChanged) {
+          const organization = (
+            await q(
+              "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+              [p.organizationId],
+            )
+          ).rows[0];
+          version = organization.config_version;
+          const targets = (
+            await q(
+              `SELECT DISTINCT controller.id
+               FROM controllers controller
+               WHERE controller.organization_id=$1 AND controller.status='active'
+                 AND EXISTS (
+                   SELECT 1 FROM assignments a
+                   JOIN credentials credential
+                     ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+                   WHERE a.organization_id=$1 AND a.vehicle_id=$2 AND a.ended_at IS NULL
+                     AND (NOT EXISTS (
+                            SELECT 1 FROM credential_lanes policy
+                            WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                          ) OR EXISTS (
+                            SELECT 1 FROM credential_lanes policy
+                            JOIN controller_lanes assigned
+                              ON assigned.organization_id=policy.organization_id
+                             AND assigned.lane_id=policy.lane_id
+                            WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                              AND assigned.controller_id=controller.id
+                          ))
+                 )`,
+              [p.organizationId, vehicle.id],
+            )
+          ).rows;
+          targetCount = targets.length;
+          for (const target of targets)
+            await q(
+              "INSERT INTO vehicle_change_controller_targets(organization_id,request_id,controller_id) VALUES($1,$2,$3)",
+              [p.organizationId, requestId, target.id],
+            );
+        }
+        await q(
+          `UPDATE vehicle_change_requests
+           SET status='approved',decision_note=$1,decided_by=$2,resolved_at=now(),
+               required_config_version=$3 WHERE id=$4`,
+          [note, p.id, version, requestId],
+        );
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_approved',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            requestId,
+            JSON.stringify({
+              vehicle_id: vehicle.id,
+              property_id: request.property_id,
+              occupancy_id: request.occupancy_id,
+              plate_changed: plateChanged,
+              required_config_version: version,
+              target_controllers: targetCount,
+              decision_note: note,
+            }),
+            p.supportGrantId ?? null,
+          ],
+        );
+        return {
+          request_id: requestId,
+          status: "approved",
+          required_config_version: version,
+          expected_controllers: targetCount,
+          acknowledged_controllers: 0,
+        };
+      });
+    } catch (error: any) {
+      if (error.code === "23505")
+        throw new BadRequestException("That plate is already active in this village.");
+      throw error;
+    }
+  }
+  async rejectVehicleChange(p: Principal, requestId: string, note: string) {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    const reference = (
+      await this.query(
+        "SELECT property_id FROM vehicle_change_requests WHERE id=$1 AND organization_id=$2",
+        [requestId, p.organizationId],
+      )
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle change request not found.");
+    return this.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          reference.property_id,
+          p.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Vehicle change request not found.");
+      const request = (
+        await q(
+          "SELECT id,status FROM vehicle_change_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [requestId, p.organizationId],
+        )
+      ).rows[0];
+      if (!request || request.status !== "pending")
+        throw new BadRequestException("This request is no longer pending.");
+      await q(
+        "UPDATE vehicle_change_requests SET status='rejected',decision_note=$1,decided_by=$2,resolved_at=now() WHERE id=$3",
+        [note, p.id, requestId],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_rejected',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          requestId,
+          JSON.stringify({ reason: note }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return { request_id: requestId, status: "rejected" };
+    });
+  }
+
+  private async vehicleControllers(q: Query, organizationId: string, vehicleId: string) {
+    return (
+      await q(
+        `SELECT DISTINCT controller.id
+         FROM controllers controller
+         WHERE controller.organization_id=$1 AND controller.status='active'
+           AND EXISTS (
+             SELECT 1 FROM assignments a
+             JOIN credentials credential
+               ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+             WHERE a.organization_id=$1 AND a.vehicle_id=$2 AND a.ended_at IS NULL
+               AND (NOT EXISTS (
+                      SELECT 1 FROM credential_lanes policy
+                      WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                    ) OR EXISTS (
+                      SELECT 1 FROM credential_lanes policy
+                      JOIN controller_lanes assigned
+                        ON assigned.organization_id=policy.organization_id
+                       AND assigned.lane_id=policy.lane_id
+                      WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                        AND assigned.controller_id=controller.id
+                    ))
+           )`,
+        [organizationId, vehicleId],
+      )
+    ).rows;
+  }
+
+  private async occupancyControllers(q: Query, organizationId: string, occupancyId: string) {
+    return (
+      await q(
+        `SELECT DISTINCT c.id
+         FROM controllers c
+         WHERE c.organization_id=$1 AND c.status='active'
+           AND EXISTS (
+             SELECT 1 FROM assignments a
+             JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+             JOIN credentials credential
+               ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+             WHERE v.organization_id=$1 AND v.occupancy_id=$2 AND a.ended_at IS NULL
+               AND (NOT EXISTS (
+                      SELECT 1 FROM credential_lanes policy
+                      WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                    ) OR EXISTS (
+                      SELECT 1 FROM credential_lanes policy
+                      JOIN controller_lanes assigned
+                        ON assigned.organization_id=policy.organization_id
+                       AND assigned.lane_id=policy.lane_id
+                      WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                        AND assigned.controller_id=c.id
+                    ))
+           )`,
+        [organizationId, occupancyId],
+      )
+    ).rows;
+  }
+
+  private async assertOccupancyBeforeCutoff(
+    q: Query,
+    organizationId: string | null,
+    occupancyId: string,
+    message = "This household's scheduled move-out is due.",
+  ) {
+    if (!organizationId) throw new ForbiddenException("Select an organization first.");
+    const due = (
+      await q(
+        `SELECT 1 FROM scheduled_move_outs
+         WHERE organization_id=$1 AND occupancy_id=$2 AND status='scheduled'
+           AND effective_at<=clock_timestamp() LIMIT 1`,
+        [organizationId, occupancyId],
+      )
+    ).rows.length;
+    if (due) throw new BadRequestException(message);
+  }
+
+  private async moveOutControllers(
+    q: Query,
+    organizationId: string,
+    occupancyId: string,
+    scheduleId?: string,
+  ) {
+    return (
+      await q(
+        `SELECT DISTINCT c.id
+         FROM controllers c
+         WHERE c.organization_id=$1 AND c.status='active'
+           AND (
+             EXISTS (
+               SELECT 1 FROM assignments a
+               JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+               JOIN credentials credential
+                 ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+               WHERE v.organization_id=$1 AND v.occupancy_id=$2 AND a.ended_at IS NULL
+                 AND (NOT EXISTS (
+                        SELECT 1 FROM credential_lanes policy
+                        WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                      ) OR EXISTS (
+                        SELECT 1 FROM credential_lanes policy
+                        JOIN controller_lanes assigned
+                          ON assigned.organization_id=policy.organization_id
+                         AND assigned.lane_id=policy.lane_id
+                        WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                          AND assigned.controller_id=c.id
+                      ))
+             )
+             OR ($3::uuid IS NOT NULL AND EXISTS (
+               SELECT 1 FROM scheduled_move_out_controller_targets t
+               WHERE t.organization_id=$1 AND t.schedule_id=$3 AND t.controller_id=c.id
+             ))
+           )`,
+        [organizationId, occupancyId, scheduleId ?? null],
+      )
+    ).rows;
+  }
+
+  private async recordScheduleRevisionTargets(
+    q: Tx,
+    organizationId: string,
+    scheduleId: string,
+    revision: number,
+    version: number,
+    targets: Array<{ id: string }>,
+  ) {
+    for (const target of targets)
+      await q(
+        `INSERT INTO scheduled_move_out_controller_targets(
+           organization_id,schedule_id,revision,controller_id,configuration_version
+         ) VALUES($1,$2,$3,$4,$5)
+         ON CONFLICT(organization_id,schedule_id,revision,controller_id)
+         DO UPDATE SET configuration_version=GREATEST(
+           scheduled_move_out_controller_targets.configuration_version,EXCLUDED.configuration_version
+         )`,
+        [organizationId, scheduleId, revision, target.id, version],
+      );
+  }
+
+  private async refreshScheduledMoveOutTargets(
+    q: Tx,
+    organizationId: string,
+    occupancyId: string,
+    version: number,
+  ) {
+    const schedule = (
+      await q(
+        `SELECT id,revision FROM scheduled_move_outs
+         WHERE organization_id=$1 AND occupancy_id=$2 AND status='scheduled' FOR NO KEY UPDATE`,
+        [organizationId, occupancyId],
+      )
+    ).rows[0];
+    if (!schedule) return;
+    const targets = await this.moveOutControllers(q, organizationId, occupancyId, schedule.id);
+    await this.recordScheduleRevisionTargets(
+      q,
+      organizationId,
+      schedule.id,
+      Number(schedule.revision),
+      version,
+      targets,
+    );
+  }
+
+  async scheduleMoveOut(p: Principal, propertyId: string, effectiveAt: Date, reason: string) {
+    if (!p.organizationId || p.role !== "hoa_admin")
+      throw new ForbiddenException("Village administrator permission is required.");
+    if (!(effectiveAt instanceof Date) || !Number.isFinite(effectiveAt.getTime()))
+      throw new BadRequestException("Enter a valid move-out date and time.");
+    return this.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          propertyId,
+          p.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Household not found.");
+      const occupancy = (
+        await q(
+          "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL FOR UPDATE",
+          [p.organizationId, propertyId],
+        )
+      ).rows[0];
+      if (!occupancy) throw new BadRequestException("This household has no active occupancy.");
+      const existing = (
+        await q(
+          `SELECT * FROM scheduled_move_outs
+           WHERE organization_id=$1 AND occupancy_id=$2 AND status='scheduled' FOR NO KEY UPDATE`,
+          [p.organizationId, occupancy.id],
+        )
+      ).rows[0];
+      const versionRow = (
+        await q(
+          "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+          [p.organizationId],
+        )
+      ).rows[0];
+      const clock = (
+        await q(
+          "SELECT clock_timestamp() AS current_time,clock_timestamp()+interval '10 minutes' AS earliest_time",
+        )
+      ).rows[0];
+      if (existing && new Date(existing.effective_at) <= new Date(clock.current_time))
+        throw new BadRequestException("A due move-out cannot be rescheduled.");
+      if (effectiveAt <= new Date(clock.earliest_time))
+        throw new BadRequestException("Schedule the move-out at least 10 minutes in advance.");
+      const scheduleId = existing?.id ?? randomUUID();
+      const revision = existing ? Number(existing.revision) + 1 : 1;
+      if (existing) {
+        await q(
+          `UPDATE scheduled_move_outs
+           SET requested_by=$1,reason=$2,effective_at=$3,revision=$4,
+               configuration_version=$5,retry_count=0,last_attempt_at=NULL,
+               next_attempt_at=NULL,last_processing_error=NULL,updated_at=clock_timestamp()
+           WHERE id=$6 AND organization_id=$7 AND status='scheduled'`,
+          [
+            p.id,
+            reason,
+            effectiveAt,
+            revision,
+            versionRow.config_version,
+            scheduleId,
+            p.organizationId,
+          ],
+        );
+      } else {
+        await q(
+          `INSERT INTO scheduled_move_outs(
+             id,organization_id,property_id,occupancy_id,requested_by,reason,effective_at,
+             revision,configuration_version
+           ) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+          [
+            scheduleId,
+            p.organizationId,
+            propertyId,
+            occupancy.id,
+            p.id,
+            reason,
+            effectiveAt,
+            revision,
+            versionRow.config_version,
+          ],
+        );
+      }
+      const targets = await this.moveOutControllers(q, p.organizationId!, occupancy.id, scheduleId);
+      await this.recordScheduleRevisionTargets(
+        q,
+        p.organizationId!,
+        scheduleId,
+        revision,
+        versionRow.config_version,
+        targets,
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,$4,$5,$6,$7)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          existing ? "property.move_out_rescheduled" : "property.move_out_scheduled",
+          scheduleId,
+          JSON.stringify({
+            property_id: propertyId,
+            occupancy_id: occupancy.id,
+            revision,
+            effective_at: effectiveAt.toISOString(),
+            reason,
+            configuration_version: versionRow.config_version,
+            target_controllers: targets.map((target: any) => target.id),
+          }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return {
+        schedule_id: scheduleId,
+        occupancy_id: occupancy.id,
+        status: "scheduled",
+        revision,
+        effective_at: effectiveAt.toISOString(),
+        configuration_version: versionRow.config_version,
+        expected_controllers: targets.length,
+        acknowledged_controllers: 0,
+      };
+    });
+  }
+
+  async cancelScheduledMoveOut(p: Principal, propertyId: string) {
+    if (!p.organizationId || p.role !== "hoa_admin")
+      throw new ForbiddenException("Village administrator permission is required.");
+    return this.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          propertyId,
+          p.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Household not found.");
+      const occupancy = (
+        await q(
+          "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL FOR UPDATE",
+          [p.organizationId, propertyId],
+        )
+      ).rows[0];
+      if (!occupancy) throw new BadRequestException("This household has no active occupancy.");
+      const schedule = (
+        await q(
+          `SELECT * FROM scheduled_move_outs
+           WHERE organization_id=$1 AND occupancy_id=$2 AND status='scheduled' FOR NO KEY UPDATE`,
+          [p.organizationId, occupancy.id],
+        )
+      ).rows[0];
+      if (!schedule)
+        throw new NotFoundException("No scheduled move-out is active for this household.");
+      const version = (
+        await q(
+          "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+          [p.organizationId],
+        )
+      ).rows[0].config_version;
+      const clock = (await q("SELECT clock_timestamp() AS current_time")).rows[0];
+      if (new Date(schedule.effective_at) <= new Date(clock.current_time))
+        throw new BadRequestException(
+          "A due move-out cannot be cancelled; complete the move-out now.",
+        );
+      const revision = Number(schedule.revision) + 1;
+      const targets = await this.moveOutControllers(
+        q,
+        p.organizationId!,
+        occupancy.id,
+        schedule.id,
+      );
+      await q(
+        `UPDATE scheduled_move_outs
+         SET status='cancelled',revision=$1,configuration_version=$2,cancelled_at=now(),updated_at=now()
+         WHERE id=$3 AND organization_id=$4 AND status='scheduled'`,
+        [revision, version, schedule.id, p.organizationId],
+      );
+      await this.recordScheduleRevisionTargets(
+        q,
+        p.organizationId!,
+        schedule.id,
+        revision,
+        version,
+        targets,
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'property.move_out_schedule_cancelled',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          schedule.id,
+          JSON.stringify({
+            property_id: propertyId,
+            occupancy_id: occupancy.id,
+            revision,
+            prior_effective_at: new Date(schedule.effective_at).toISOString(),
+            configuration_version: version,
+            target_controllers: targets.map((target: any) => target.id),
+          }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return {
+        schedule_id: schedule.id,
+        status: "cancelled",
+        revision,
+        configuration_version: version,
+        expected_controllers: targets.length,
+        acknowledged_controllers: 0,
+      };
+    });
+  }
+
+  async requestVehicleRetirement(p: Principal, vehicleId: string, reason: string) {
+    if (!p.organizationId || p.role !== "resident" || !p.membershipId)
+      throw new ForbiddenException("A resident membership is required.");
+    const reference = (
+      await this.query("SELECT property_id FROM vehicles WHERE id=$1 AND organization_id=$2", [
+        vehicleId,
+        p.organizationId,
+      ])
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle not found.");
+    try {
+      return await this.transaction(async (q) => {
+        const property = (
+          await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+            reference.property_id,
+            p.organizationId!,
+          ])
+        ).rows[0];
+        const vehicle = (
+          await q(
+            `SELECT v.id,v.property_id,v.occupancy_id,v.plate,v.active,o.ended_at
+             FROM vehicles v JOIN property_occupancies o
+               ON o.id=v.occupancy_id AND o.organization_id=v.organization_id
+             WHERE v.id=$1 AND v.organization_id=$2 FOR UPDATE OF v,o`,
+            [vehicleId, p.organizationId],
+          )
+        ).rows[0];
+        const member = vehicle
+          ? (
+              await q(
+                `SELECT 1 FROM property_memberships pm
+                 JOIN organization_memberships m ON m.id=pm.membership_id
+                 WHERE pm.organization_id=$1 AND pm.property_id=$2 AND pm.occupancy_id=$3
+                   AND pm.membership_id=$4 AND pm.ended_at IS NULL
+                   AND m.status='active' AND m.role='resident'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM scheduled_move_outs s
+                     WHERE s.organization_id=pm.organization_id AND s.occupancy_id=pm.occupancy_id
+                       AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+                   ) LIMIT 1`,
+                [p.organizationId, vehicle.property_id, vehicle.occupancy_id, p.membershipId],
+              )
+            ).rows.length
+          : 0;
+        if (!property || !vehicle || !vehicle.active || vehicle.ended_at || !member)
+          throw new NotFoundException("Active household vehicle not found.");
+        const id = randomUUID();
+        await q(
+          `INSERT INTO vehicle_retirement_requests(
+             id,organization_id,property_id,occupancy_id,vehicle_id,requested_by,source,reason
+           ) VALUES($1,$2,$3,$4,$5,$6,'resident',$7)`,
+          [
+            id,
+            p.organizationId,
+            vehicle.property_id,
+            vehicle.occupancy_id,
+            vehicleId,
+            p.id,
+            reason,
+          ],
+        );
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.retirement_requested',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            id,
+            JSON.stringify({
+              property_id: vehicle.property_id,
+              occupancy_id: vehicle.occupancy_id,
+              vehicle_id: vehicle.id,
+              plate: vehicle.plate,
+              reason,
+            }),
+            p.supportGrantId ?? null,
+          ],
+        );
+        return { request_id: id, status: "pending" };
+      });
+    } catch (error: any) {
+      if (error.code === "23505")
+        throw new BadRequestException("This vehicle already has a pending retirement request.");
+      throw error;
+    }
+  }
+
+  private async applyVehicleRetirement(
+    q: Tx,
+    p: Principal,
+    request: any,
+    note: string,
+  ): Promise<
+    DeliveryCounts & { request_id: string; status: string; required_config_version: number | null }
+  > {
+    if (request.status !== "pending")
+      throw new BadRequestException("This vehicle retirement is no longer pending.");
+    const active = (
+      await q(
+        `SELECT v.id,v.property_id,v.occupancy_id,v.plate,v.make,v.color
+         FROM vehicles v JOIN property_occupancies o
+           ON o.id=v.occupancy_id AND o.organization_id=v.organization_id
+         WHERE v.id=$1 AND v.organization_id=$2 AND v.active AND o.ended_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM scheduled_move_outs s
+             WHERE s.organization_id=o.organization_id AND s.occupancy_id=o.id
+               AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+           )
+         FOR UPDATE OF v,o`,
+        [request.vehicle_id, p.organizationId],
+      )
+    ).rows[0];
+    if (!active || active.occupancy_id !== request.occupancy_id)
+      throw new BadRequestException("The household or vehicle is no longer active.");
+    await this.assertOccupancyBeforeCutoff(q, p.organizationId, active.occupancy_id);
+    if (request.source === "resident") {
+      const requesterStillBelongs = (
+        await q(
+          `SELECT 1 FROM property_memberships pm
+           JOIN organization_memberships m ON m.id=pm.membership_id
+           WHERE pm.organization_id=$1 AND pm.property_id=$2 AND pm.occupancy_id=$3
+             AND pm.ended_at IS NULL AND m.status='active' AND m.role='resident'
+             AND m.user_id=$4 LIMIT 1`,
+          [p.organizationId, request.property_id, request.occupancy_id, request.requested_by],
+        )
+      ).rows.length;
+      if (!requesterStillBelongs)
+        throw new BadRequestException("The resident no longer belongs to this household.");
+    }
+    const assigned = (
+      await q(
+        `SELECT a.credential_id,c.status AS credential_status
+         FROM assignments a JOIN credentials c
+           ON c.id=a.credential_id AND c.organization_id=a.organization_id
+         WHERE a.organization_id=$1 AND a.vehicle_id=$2 AND a.ended_at IS NULL
+         FOR UPDATE OF a,c`,
+        [p.organizationId, active.id],
+      )
+    ).rows;
+    const targets = assigned.length
+      ? await this.vehicleControllers(q, p.organizationId!, active.id)
+      : [];
+    let version: number | null = null;
+    if (assigned.length) {
+      const organization = (
+        await q(
+          "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+          [p.organizationId],
+        )
+      ).rows[0];
+      version = organization.config_version;
+      for (const target of targets)
+        await q(
+          "INSERT INTO vehicle_retirement_controller_targets(organization_id,request_id,controller_id) VALUES($1,$2,$3)",
+          [p.organizationId, request.id, target.id],
+        );
+    }
+    const cancelledChanges = (
+      await q(
+        `UPDATE vehicle_change_requests
+         SET status='cancelled',decision_note='Vehicle access was retired.',decided_by=$1,resolved_at=now()
+         WHERE organization_id=$2 AND vehicle_id=$3 AND status='pending'
+         RETURNING id`,
+        [p.id, p.organizationId, active.id],
+      )
+    ).rows;
+    for (const change of cancelledChanges)
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_cancelled',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          change.id,
+          JSON.stringify({ reason: "vehicle_retired" }),
+          p.supportGrantId ?? null,
+        ],
+      );
+    const cancelledReplacements = (
+      await q(
+        `UPDATE credential_replacement_requests r
+         SET status='rejected',decision_note='Vehicle access was retired.',decided_by=$1,resolved_at=now()
+         FROM assignments a
+         WHERE a.credential_id=r.credential_id AND a.organization_id=r.organization_id
+           AND a.vehicle_id=$3 AND a.ended_at IS NULL
+           AND r.organization_id=$2 AND r.status='pending'
+         RETURNING r.id,r.credential_id`,
+        [p.id, p.organizationId, active.id],
+      )
+    ).rows;
+    for (const replacement of cancelledReplacements)
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.replacement_cancelled',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          replacement.id,
+          JSON.stringify({ credential_id: replacement.credential_id, reason: "vehicle_retired" }),
+          p.supportGrantId ?? null,
+        ],
+      );
+    await q(
+      `UPDATE credentials c SET status='revoked'
+       WHERE c.organization_id=$1 AND EXISTS (
+         SELECT 1 FROM assignments a
+         WHERE a.organization_id=$1 AND a.vehicle_id=$2 AND a.credential_id=c.id
+           AND a.ended_at IS NULL
+       )`,
+      [p.organizationId, active.id],
+    );
+    await q(
+      "UPDATE assignments SET ended_at=now() WHERE organization_id=$1 AND vehicle_id=$2 AND ended_at IS NULL",
+      [p.organizationId, active.id],
+    );
+    await q("UPDATE vehicles SET active=false WHERE organization_id=$1 AND id=$2", [
+      p.organizationId,
+      active.id,
+    ]);
+    await q(
+      `UPDATE vehicle_retirement_requests
+       SET status='approved',decision_note=$1,decided_by=$2,resolved_at=now(),required_config_version=$3
+       WHERE organization_id=$4 AND id=$5 AND status='pending'`,
+      [note, p.id, version, p.organizationId, request.id],
+    );
+    const result = {
+      request_id: request.id,
+      status: "approved",
+      required_config_version: version,
+      expected_controllers: targets.length,
+      acknowledged_controllers: 0,
+    };
+    await q(
+      "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.retired',$4,$5,$6)",
+      [
+        randomUUID(),
+        p.organizationId,
+        p.id,
+        active.id,
+        JSON.stringify({
+          request_id: request.id,
+          property_id: request.property_id,
+          occupancy_id: request.occupancy_id,
+          plate: active.plate,
+          source: request.source,
+          reason: request.reason,
+          decision_note: note,
+          cancelled_correction_requests: cancelledChanges.map((row: any) => row.id),
+          cancelled_replacement_requests: cancelledReplacements.map((row: any) => row.id),
+          target_controllers: targets.map((row: any) => row.id),
+          required_config_version: version,
+        }),
+        p.supportGrantId ?? null,
+      ],
+    );
+    return result;
+  }
+
+  async approveVehicleRetirement(p: Principal, requestId: string, note = "") {
+    if (!p.organizationId || p.role !== "hoa_admin")
+      throw new ForbiddenException("Village administrator permission is required.");
+    const reference = (
+      await this.query(
+        "SELECT property_id FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2",
+        [requestId, p.organizationId],
+      )
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle retirement request not found.");
+    return this.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          reference.property_id,
+          p.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Vehicle retirement request not found.");
+      const request = (
+        await q(
+          "SELECT * FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [requestId, p.organizationId],
+        )
+      ).rows[0];
+      if (!request) throw new NotFoundException("Vehicle retirement request not found.");
+      return this.applyVehicleRetirement(q, p, request, note);
+    });
+  }
+
+  async rejectVehicleRetirement(p: Principal, requestId: string, note: string) {
+    if (!p.organizationId || p.role !== "hoa_admin")
+      throw new ForbiddenException("Village administrator permission is required.");
+    const reference = (
+      await this.query(
+        "SELECT property_id FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2",
+        [requestId, p.organizationId],
+      )
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle retirement request not found.");
+    return this.transaction(async (q) => {
+      await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+        reference.property_id,
+        p.organizationId,
+      ]);
+      const request = (
+        await q(
+          "SELECT * FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [requestId, p.organizationId],
+        )
+      ).rows[0];
+      if (!request || request.status !== "pending")
+        throw new BadRequestException("This vehicle retirement is no longer pending.");
+      await q(
+        "UPDATE vehicle_retirement_requests SET status='rejected',decision_note=$1,decided_by=$2,resolved_at=now() WHERE id=$3",
+        [note, p.id, requestId],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.retirement_rejected',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          requestId,
+          JSON.stringify({ note }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return { request_id: requestId, status: "rejected" };
+    });
+  }
+
+  async cancelVehicleRetirement(p: Principal, requestId: string) {
+    if (!p.organizationId || p.role !== "resident" || !p.membershipId)
+      throw new ForbiddenException("A resident membership is required.");
+    const reference = (
+      await this.query(
+        "SELECT property_id FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2",
+        [requestId, p.organizationId],
+      )
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle retirement request not found.");
+    return this.transaction(async (q) => {
+      await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+        reference.property_id,
+        p.organizationId,
+      ]);
+      const request = (
+        await q(
+          "SELECT * FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [requestId, p.organizationId],
+        )
+      ).rows[0];
+      if (
+        !request ||
+        request.status !== "pending" ||
+        request.source !== "resident" ||
+        request.requested_by !== p.id
+      )
+        throw new NotFoundException("Pending vehicle retirement request not found.");
+      const membership = (
+        await q(
+          `SELECT 1 FROM property_memberships
+           WHERE organization_id=$1 AND occupancy_id=$2 AND membership_id=$3 AND ended_at IS NULL`,
+          [p.organizationId, request.occupancy_id, p.membershipId],
+        )
+      ).rows.length;
+      if (!membership) throw new NotFoundException("Pending vehicle retirement request not found.");
+      await this.assertOccupancyBeforeCutoff(q, p.organizationId, request.occupancy_id);
+      await q(
+        "UPDATE vehicle_retirement_requests SET status='cancelled',decision_note='Cancelled by resident.',decided_by=$1,resolved_at=now() WHERE id=$2",
+        [p.id, requestId],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.retirement_cancelled',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          requestId,
+          JSON.stringify({ vehicle_id: request.vehicle_id }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return { request_id: requestId, status: "cancelled" };
+    });
+  }
+
+  async retireVehicle(p: Principal, vehicleId: string, reason: string) {
+    if (!p.organizationId || p.role !== "hoa_admin")
+      throw new ForbiddenException("Village administrator permission is required.");
+    const reference = (
+      await this.query("SELECT property_id FROM vehicles WHERE id=$1 AND organization_id=$2", [
+        vehicleId,
+        p.organizationId,
+      ])
+    ).rows[0];
+    if (!reference) throw new NotFoundException("Vehicle not found.");
+    return this.transaction(async (q) => {
+      await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+        reference.property_id,
+        p.organizationId,
+      ]);
+      const vehicle = (
+        await q(
+          `SELECT v.id,v.property_id,v.occupancy_id,v.active,o.ended_at
+           FROM vehicles v JOIN property_occupancies o
+             ON o.id=v.occupancy_id AND o.organization_id=v.organization_id
+           WHERE v.id=$1 AND v.organization_id=$2 FOR UPDATE OF v,o`,
+          [vehicleId, p.organizationId],
+        )
+      ).rows[0];
+      if (!vehicle || !vehicle.active || vehicle.ended_at)
+        throw new BadRequestException("This vehicle is not in an active household.");
+      await this.assertOccupancyBeforeCutoff(q, p.organizationId, vehicle.occupancy_id);
+      const pending = (
+        await q(
+          "SELECT id FROM vehicle_retirement_requests WHERE organization_id=$1 AND vehicle_id=$2 AND status='pending' FOR UPDATE",
+          [p.organizationId, vehicleId],
+        )
+      ).rows[0];
+      if (pending)
+        throw new BadRequestException("Review the pending resident retirement request first.");
+      const id = randomUUID();
+      await q(
+        `INSERT INTO vehicle_retirement_requests(
+           id,organization_id,property_id,occupancy_id,vehicle_id,requested_by,source,reason
+         ) VALUES($1,$2,$3,$4,$5,$6,'hoa',$7)`,
+        [id, p.organizationId, vehicle.property_id, vehicle.occupancy_id, vehicleId, p.id, reason],
+      );
+      const request = (
+        await q(
+          "SELECT * FROM vehicle_retirement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [id, p.organizationId],
+        )
+      ).rows[0];
+      // Direct HOA removal is recorded as one approved retirement; no resident review is pending.
+      return this.applyVehicleRetirement(q, p, request, reason);
+    });
+  }
+
+  async moveOut(
+    p: Principal,
+    propertyId: string,
+    reason = "",
+    options: {
+      effectiveAt?: Date;
+      scheduleId?: string;
+      expectedOccupancyId?: string;
+    } = {},
+  ) {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    return this.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          propertyId,
+          p.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Household not found.");
+      const occupancy = (
+        await q(
+          "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL FOR UPDATE",
+          [p.organizationId, propertyId],
+        )
+      ).rows[0];
+      if (!occupancy) {
+        if (options.scheduleId)
+          return { schedule_id: options.scheduleId, status: "already_processed" };
+        throw new BadRequestException("This household has no active occupancy.");
+      }
+      if (options.expectedOccupancyId && occupancy.id !== options.expectedOccupancyId)
+        return { schedule_id: options.scheduleId, status: "stale_occupancy" };
+      const schedule = (
+        await q(
+          `SELECT * FROM scheduled_move_outs
+           WHERE organization_id=$1 AND occupancy_id=$2 AND status='scheduled' FOR NO KEY UPDATE`,
+          [p.organizationId, occupancy.id],
+        )
+      ).rows[0];
+      let effectiveAt = options.effectiveAt;
+      let endReason = reason;
+      let endingActor = p.id;
+      let completingSchedule = false;
+      if (options.scheduleId) {
+        if (!schedule || schedule.id !== options.scheduleId)
+          return { schedule_id: options.scheduleId, status: "already_processed" };
+        const current = (await q("SELECT clock_timestamp() AS current_time")).rows[0].current_time;
+        if (new Date(schedule.effective_at) > new Date(current))
+          return { schedule_id: options.scheduleId, status: "not_due" };
+        effectiveAt = new Date(schedule.effective_at);
+        endReason = schedule.reason;
+        endingActor = schedule.requested_by;
+        completingSchedule = true;
+      } else if (schedule) {
+        const current = (await q("SELECT clock_timestamp() AS current_time")).rows[0].current_time;
+        if (new Date(schedule.effective_at) <= new Date(current)) {
+          effectiveAt = new Date(schedule.effective_at);
+          endReason = schedule.reason;
+          endingActor = schedule.requested_by;
+          completingSchedule = true;
+        } else {
+          effectiveAt = new Date(current);
+        }
+      } else if (!effectiveAt) {
+        effectiveAt = new Date(
+          (await q("SELECT clock_timestamp() AS current_time")).rows[0].current_time,
+        );
+      }
+      const endAt = effectiveAt ?? new Date();
+
+      const revokedInvitations = (
+        await q(
+          `UPDATE invitations SET revoked_at=$1
+           WHERE organization_id=$2 AND property_id=$3 AND role='resident'
+             AND accepted_at IS NULL AND revoked_at IS NULL
+            RETURNING id,email`,
+          [effectiveAt, p.organizationId, propertyId],
+        )
+      ).rows;
+      for (const invitation of revokedInvitations)
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'invitation.revoked',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            invitation.id,
+            JSON.stringify({ role: "resident", email: invitation.email, reason: "move_out" }),
+            p.supportGrantId ?? null,
+          ],
+        );
+
+      // Lock the live vehicle, assignment, and credential rows before taking the controller
+      // targets. Enrollment and resident invitation acceptance lock the property row above.
+      const liveCredentials = (
+        await q(
+          `SELECT c.id AS credential_id,c.value,v.id AS vehicle_id,v.plate
+           FROM vehicles v
+           JOIN assignments a ON a.vehicle_id=v.id AND a.organization_id=v.organization_id AND a.ended_at IS NULL
+           JOIN credentials c ON c.id=a.credential_id AND c.organization_id=a.organization_id
+           WHERE v.organization_id=$1 AND v.occupancy_id=$2
+           FOR UPDATE OF v,a,c`,
+          [p.organizationId, occupancy.id],
+        )
+      ).rows;
+      const vehicles = (
+        await q(
+          "SELECT id FROM vehicles WHERE organization_id=$1 AND occupancy_id=$2 AND active FOR UPDATE",
+          [p.organizationId, occupancy.id],
+        )
+      ).rows;
+      const targets = (
+        await q(
+          `SELECT DISTINCT c.id
+           FROM controllers c
+           WHERE c.organization_id=$1 AND c.status='active'
+             AND EXISTS (
+               SELECT 1 FROM assignments a
+               JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+               JOIN credentials credential ON credential.id=a.credential_id AND credential.organization_id=a.organization_id
+               WHERE v.organization_id=$1 AND v.occupancy_id=$2 AND a.ended_at IS NULL
+                 AND (NOT EXISTS (
+                        SELECT 1 FROM credential_lanes policy
+                        WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                      ) OR EXISTS (
+                        SELECT 1 FROM credential_lanes policy
+                        JOIN controller_lanes assigned
+                          ON assigned.organization_id=policy.organization_id
+                         AND assigned.lane_id=policy.lane_id
+                        WHERE policy.organization_id=$1 AND policy.credential_id=credential.id
+                          AND assigned.controller_id=c.id
+                      ))
+             )`,
+          [p.organizationId, occupancy.id],
+        )
+      ).rows;
+      if (schedule) {
+        const previouslyTargeted = (
+          await q(
+            "SELECT DISTINCT controller_id AS id FROM scheduled_move_out_controller_targets WHERE organization_id=$1 AND schedule_id=$2",
+            [p.organizationId, schedule.id],
+          )
+        ).rows;
+        for (const previous of previouslyTargeted)
+          if (!targets.some((target: any) => target.id === previous.id)) targets.push(previous);
+      }
+      for (const target of targets)
+        await q(
+          "INSERT INTO occupancy_controller_targets(organization_id,occupancy_id,controller_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+          [p.organizationId, occupancy.id, target.id],
+        );
+
+      const canceledRequests = (
+        await q(
+          `UPDATE credential_replacement_requests r
+           SET status='rejected',decision_note='Household occupancy ended.',decided_by=$1,resolved_at=$2
+           FROM vehicles v
+           WHERE v.id=r.vehicle_id AND v.organization_id=r.organization_id
+              AND v.organization_id=$3 AND v.occupancy_id=$4 AND r.status='pending'
+           RETURNING r.id,r.credential_id`,
+          [endingActor, effectiveAt, p.organizationId, occupancy.id],
+        )
+      ).rows;
+      for (const request of canceledRequests)
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.replacement_cancelled',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            request.id,
+            JSON.stringify({ credential_id: request.credential_id, reason: "occupancy_ended" }),
+            p.supportGrantId ?? null,
+          ],
+        );
+      const canceledVehicleChanges = (
+        await q(
+          `UPDATE vehicle_change_requests
+           SET status='cancelled',decision_note='Household occupancy ended.',
+               decided_by=$1,resolved_at=$2
+           WHERE organization_id=$3 AND occupancy_id=$4 AND status='pending'
+            RETURNING id,vehicle_id`,
+          [endingActor, effectiveAt, p.organizationId, occupancy.id],
+        )
+      ).rows;
+      for (const request of canceledVehicleChanges)
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_cancelled',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            request.id,
+            JSON.stringify({ vehicle_id: request.vehicle_id, reason: "occupancy_ended" }),
+            p.supportGrantId ?? null,
+          ],
+        );
+      const canceledRetirements = (
+        await q(
+          `UPDATE vehicle_retirement_requests
+           SET status='cancelled',decision_note='Household occupancy ended.',
+               decided_by=$1,resolved_at=$2
+           WHERE organization_id=$3 AND occupancy_id=$4 AND status='pending'
+           RETURNING id,vehicle_id`,
+          [endingActor, effectiveAt, p.organizationId, occupancy.id],
+        )
+      ).rows;
+      for (const request of canceledRetirements)
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.retirement_cancelled',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            request.id,
+            JSON.stringify({ vehicle_id: request.vehicle_id, reason: "occupancy_ended" }),
+            p.supportGrantId ?? null,
+          ],
+        );
+      await q(
+        `UPDATE credentials c SET status='revoked'
+         WHERE c.organization_id=$1 AND EXISTS (
+           SELECT 1 FROM assignments a
+           JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+           WHERE a.organization_id=$1 AND a.credential_id=c.id AND a.ended_at IS NULL
+             AND v.occupancy_id=$2
+         )`,
+        [p.organizationId, occupancy.id],
+      );
+      await q(
+        "UPDATE assignments SET ended_at=$1 WHERE organization_id=$2 AND ended_at IS NULL AND vehicle_id IN (SELECT id FROM vehicles WHERE organization_id=$2 AND occupancy_id=$3)",
+        [endAt, p.organizationId, occupancy.id],
+      );
+      await q(
+        "UPDATE vehicles SET active=false WHERE organization_id=$1 AND occupancy_id=$2 AND active",
+        [p.organizationId, occupancy.id],
+      );
+      await q(
+        "UPDATE property_memberships SET ended_at=$1 WHERE organization_id=$2 AND occupancy_id=$3 AND ended_at IS NULL",
+        [endAt, p.organizationId, occupancy.id],
+      );
+      const organization = (
+        await q(
+          "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+          [p.organizationId],
+        )
+      ).rows[0];
+      if (schedule) {
+        if (completingSchedule) {
+          await q(
+            `UPDATE scheduled_move_outs
+             SET status='completed',completed_at=clock_timestamp(),executed_by=$1,
+                 completed_configuration_version=$2,next_attempt_at=NULL,
+                 last_processing_error=NULL,updated_at=clock_timestamp()
+             WHERE id=$3 AND organization_id=$4 AND status='scheduled'`,
+            [p.id, organization.config_version, schedule.id, p.organizationId],
+          );
+        } else {
+          const revision = Number(schedule.revision) + 1;
+          await q(
+            `UPDATE scheduled_move_outs
+             SET status='cancelled',revision=$1,configuration_version=$2,
+                 cancelled_at=now(),updated_at=now()
+             WHERE id=$3 AND organization_id=$4 AND status='scheduled'`,
+            [revision, organization.config_version, schedule.id, p.organizationId],
+          );
+          await this.recordScheduleRevisionTargets(
+            q,
+            p.organizationId!,
+            schedule.id,
+            revision,
+            organization.config_version,
+            targets,
+          );
+        }
+      }
+      await q(
+        `UPDATE property_occupancies
+         SET ended_at=$1,end_reason=$2,ended_by=$3,required_config_version=$4
+         WHERE id=$5 AND organization_id=$6`,
+        [
+          endAt,
+          endReason,
+          endingActor,
+          organization.config_version,
+          occupancy.id,
+          p.organizationId,
+        ],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'property.occupancy_ended',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          occupancy.id,
+          JSON.stringify({
+            property_id: propertyId,
+            vehicle_ids: vehicles.map((vehicle: any) => vehicle.id),
+            credentials: liveCredentials.map((credential: any) => ({
+              id: credential.credential_id,
+              vehicle_id: credential.vehicle_id,
+              plate: credential.plate,
+            })),
+            canceled_replacement_requests: canceledRequests.map((request: any) => request.id),
+            canceled_vehicle_changes: canceledVehicleChanges.map((request: any) => request.id),
+            canceled_vehicle_retirements: canceledRetirements.map((request: any) => request.id),
+            target_controllers: targets.map((target: any) => target.id),
+            required_config_version: organization.config_version,
+            reason: endReason,
+            effective_at: endAt.toISOString(),
+            ...(schedule
+              ? {
+                  schedule_id: schedule.id,
+                  schedule_revision: schedule.revision,
+                  scheduled_by: schedule.requested_by,
+                  processed_at: new Date().toISOString(),
+                }
+              : {}),
+          }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return {
+        occupancy_id: occupancy.id,
+        property_id: propertyId,
+        status: "ended",
+        configuration_version: organization.config_version,
+        vehicle_count: vehicles.length,
+        credential_count: liveCredentials.length,
+        canceled_request_count: canceledRequests.length,
+        canceled_vehicle_change_count: canceledVehicleChanges.length,
+        canceled_vehicle_retirement_count: canceledRetirements.length,
+        revoked_invitation_count: revokedInvitations.length,
+        expected_controllers: targets.length,
+        acknowledged_controllers: 0,
+      };
+    });
+  }
+  async reportLostCredential(p: Principal, id: string) {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    return this.transaction(async (q) => {
+      const current = (
+        await q(
+          `SELECT c.id,c.status,v.id AS vehicle_id,v.property_id
+           FROM credentials c
+           JOIN assignments a ON a.credential_id=c.id AND a.organization_id=c.organization_id AND a.ended_at IS NULL
+           JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+           JOIN property_occupancies o ON o.id=v.occupancy_id AND o.organization_id=v.organization_id
+             AND o.ended_at IS NULL
+           WHERE c.id=$1 AND c.organization_id=$2 AND v.active
+             AND NOT EXISTS (
+               SELECT 1 FROM scheduled_move_outs s
+               WHERE s.organization_id=o.organization_id AND s.occupancy_id=o.id
+                 AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+             )
+           FOR UPDATE OF c,v`,
+          [id, p.organizationId],
+        )
+      ).rows[0];
+      if (!current || (p.role === "resident" && !p.properties.includes(current.property_id)))
+        throw new NotFoundException("Credential not found.");
+      if (current.status === "revoked")
+        throw new BadRequestException("A revoked credential cannot be replaced.");
+
+      const existing = (
+        await q(
+          "SELECT id,required_config_version FROM credential_replacement_requests WHERE organization_id=$1 AND credential_id=$2 AND status='pending'",
+          [p.organizationId, id],
+        )
+      ).rows[0];
+      if (existing)
+        return {
+          request_id: existing.id,
+          status: "pending",
+          required_config_version: existing.required_config_version,
+          already_pending: true,
+        };
+
+      if (current.status !== "lost")
+        await q("UPDATE credentials SET status='lost' WHERE id=$1 AND organization_id=$2", [
+          id,
+          p.organizationId,
+        ]);
+      const organization =
+        current.status === "lost"
+          ? (await q("SELECT config_version FROM organizations WHERE id=$1", [p.organizationId]))
+              .rows[0]
+          : (
+              await q(
+                "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+                [p.organizationId],
+              )
+            ).rows[0];
+      const requestId = randomUUID();
+      await q(
+        `INSERT INTO credential_replacement_requests
+           (id,organization_id,property_id,vehicle_id,credential_id,requested_by,required_config_version)
+         VALUES($1,$2,$3,$4,$5,$6,$7)`,
+        [
+          requestId,
+          p.organizationId,
+          current.property_id,
+          current.vehicle_id,
+          id,
+          p.id,
+          organization.config_version,
+        ],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.loss_reported',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          requestId,
+          JSON.stringify({ credential_id: id, vehicle_id: current.vehicle_id }),
+          p.supportGrantId ?? null,
+        ],
+      );
+      return {
+        request_id: requestId,
+        status: "pending",
+        required_config_version: organization.config_version,
+        already_pending: false,
+      };
+    });
+  }
+  async issueCredentialReplacement(
+    p: Principal,
+    requestId: string,
+    input: { format: string; value: string },
+  ) {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    try {
+      return await this.transaction(async (q) => {
+        const scope = (
+          await q(
+            `SELECT r.property_id,v.occupancy_id
+             FROM credential_replacement_requests r
+             JOIN vehicles v ON v.id=r.vehicle_id AND v.organization_id=r.organization_id
+             WHERE r.id=$1 AND r.organization_id=$2`,
+            [requestId, p.organizationId],
+          )
+        ).rows[0];
+        if (!scope) throw new NotFoundException("Replacement request not found.");
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          scope.property_id,
+          p.organizationId,
+        ]);
+        const occupancy = (
+          await q(
+            "SELECT id FROM property_occupancies WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+            [scope.occupancy_id, p.organizationId],
+          )
+        ).rows[0];
+        if (!occupancy)
+          throw new BadRequestException(
+            "The household occupancy for this request no longer exists.",
+          );
+        const activeOccupancy = (
+          await q("SELECT id FROM property_occupancies WHERE id=$1 AND ended_at IS NULL", [
+            occupancy.id,
+          ])
+        ).rows[0];
+        if (!activeOccupancy)
+          throw new BadRequestException(
+            "The household moved out before this replacement was issued.",
+          );
+        await this.assertOccupancyBeforeCutoff(q, p.organizationId, occupancy.id);
+        const request = (
+          await q(
+            "SELECT id,vehicle_id,credential_id,status FROM credential_replacement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+            [requestId, p.organizationId],
+          )
+        ).rows[0];
+        if (!request) throw new NotFoundException("Replacement request not found.");
+        if (request.status !== "pending")
+          throw new BadRequestException("This replacement request has already been decided.");
+        const assignment = (
+          await q(
+            `SELECT a.id,v.property_id FROM assignments a
+             JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+             WHERE a.organization_id=$1 AND a.credential_id=$2 AND a.vehicle_id=$3
+               AND a.ended_at IS NULL FOR UPDATE OF a`,
+            [p.organizationId, request.credential_id, request.vehicle_id],
+          )
+        ).rows[0];
+        if (!assignment)
+          throw new BadRequestException(
+            "The vehicle no longer has the credential in this request.",
+          );
+
+        const credentialId = randomUUID();
+        await q(
+          "UPDATE assignments SET ended_at=now() WHERE id=$1 AND ended_at IS NULL RETURNING id",
+          [assignment.id],
+        );
+        await q(
+          "INSERT INTO credentials(id,organization_id,format,value,status,valid_from) VALUES($1,$2,$3,$4,'active',now())",
+          [credentialId, p.organizationId, input.format, input.value],
+        );
+        await q(
+          "INSERT INTO assignments(id,organization_id,credential_id,vehicle_id) VALUES($1,$2,$3,$4)",
+          [randomUUID(), p.organizationId, credentialId, request.vehicle_id],
+        );
+        const lanes = (
+          await q(
+            "SELECT lane_id FROM credential_lanes WHERE organization_id=$1 AND credential_id=$2",
+            [p.organizationId, request.credential_id],
+          )
+        ).rows;
+        for (const lane of lanes)
+          await q(
+            "INSERT INTO credential_lanes(id,organization_id,credential_id,lane_id) VALUES($1,$2,$3,$4)",
+            [randomUUID(), p.organizationId, credentialId, lane.lane_id],
+          );
+        const organization = (
+          await q(
+            "UPDATE organizations SET config_version=config_version+1 WHERE id=$1 RETURNING config_version",
+            [p.organizationId],
+          )
+        ).rows[0];
+        await this.refreshScheduledMoveOutTargets(
+          q,
+          p.organizationId!,
+          occupancy.id,
+          organization.config_version,
+        );
+        await q(
+          `UPDATE credential_replacement_requests
+           SET status='issued',replacement_credential_id=$1,required_config_version=$2,
+               decided_by=$3,resolved_at=now()
+           WHERE id=$4 AND organization_id=$5`,
+          [credentialId, organization.config_version, p.id, requestId, p.organizationId],
+        );
+        await q(
+          "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.replacement_issued',$4,$5,$6)",
+          [
+            randomUUID(),
+            p.organizationId,
+            p.id,
+            requestId,
+            JSON.stringify({
+              previous_credential_id: request.credential_id,
+              replacement_credential_id: credentialId,
+              vehicle_id: request.vehicle_id,
+            }),
+            p.supportGrantId ?? null,
+          ],
+        );
+        return {
+          request_id: requestId,
+          credential_id: credentialId,
+          configuration_version: organization.config_version,
+          status: "issued",
+        };
+      });
+    } catch (error: any) {
+      if (error.code === "23505")
+        throw new BadRequestException("That tag is already enrolled in this village.");
+      throw error;
+    }
+  }
+  async rejectCredentialReplacement(p: Principal, requestId: string, note = "") {
+    if (!p.organizationId) throw new ForbiddenException("Select an organization first.");
+    await this.transaction(async (q) => {
+      const request = (
+        await q(
+          "SELECT id,status FROM credential_replacement_requests WHERE id=$1 AND organization_id=$2 FOR UPDATE",
+          [requestId, p.organizationId],
+        )
+      ).rows[0];
+      if (!request) throw new NotFoundException("Replacement request not found.");
+      if (request.status !== "pending")
+        throw new BadRequestException("This replacement request has already been decided.");
+      await q(
+        `UPDATE credential_replacement_requests
+         SET status='rejected',decision_note=$1,decided_by=$2,resolved_at=now()
+         WHERE id=$3 AND organization_id=$4`,
+        [note, p.id, requestId, p.organizationId],
+      );
+      await q(
+        "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'credential.replacement_rejected',$4,$5,$6)",
+        [
+          randomUUID(),
+          p.organizationId,
+          p.id,
+          requestId,
+          JSON.stringify({ note }),
+          p.supportGrantId ?? null,
+        ],
+      );
+    });
+    return { request_id: requestId, status: "rejected" };
+  }
   async configuration(device?: DeviceIdentity): Promise<Configuration> {
     const identity =
       device ??
@@ -862,6 +3357,11 @@ export class Store {
       const records = (
         await q(
           `SELECT c.*,v.id AS vehicle_id,v.plate AS vehicle_plate,v.active,
+                  CASE
+                    WHEN s.effective_at IS NULL THEN c.valid_until
+                    WHEN c.valid_until IS NULL THEN s.effective_at
+                    ELSE LEAST(c.valid_until,s.effective_at)
+                  END AS effective_valid_until,
                   (SELECT count(*)::int FROM credential_lanes cl WHERE cl.credential_id=c.id) AS policy_count,
                   (SELECT array_agg(cl.lane_id::text ORDER BY cl.lane_id)
                      FROM credential_lanes cl
@@ -869,6 +3369,9 @@ export class Store {
            FROM credentials c
            JOIN assignments a ON a.credential_id=c.id AND a.organization_id=c.organization_id AND a.ended_at IS NULL
            JOIN vehicles v ON v.id=a.vehicle_id AND v.organization_id=a.organization_id
+           LEFT JOIN scheduled_move_outs s
+             ON s.organization_id=v.organization_id AND s.occupancy_id=v.occupancy_id
+            AND s.status='scheduled'
            WHERE c.organization_id=$1 ORDER BY c.id`,
           [identity.organizationId, identity.laneIds],
         )
@@ -880,6 +3383,11 @@ export class Store {
             ? (c.policy_lane_ids ?? []).filter((laneId: string) => allowed.has(laneId))
             : identity.laneIds;
         if (!laneIds.length) return [];
+        const validUntil = c.effective_valid_until ? new Date(c.effective_valid_until) : null;
+        const validFrom = new Date(c.valid_from);
+        // A schedule may be moved earlier than a newly issued credential's start. Such a
+        // credential must not be exported with an invalid validity window.
+        if (validUntil && validUntil <= validFrom) return [];
         return [
           {
             id: c.id,
@@ -889,8 +3397,8 @@ export class Store {
             vehicle_id: c.vehicle_id,
             vehicle_plate: c.vehicle_plate,
             lane_ids: laneIds,
-            valid_from: new Date(c.valid_from).toISOString(),
-            valid_until: c.valid_until ? new Date(c.valid_until).toISOString() : null,
+            valid_from: validFrom.toISOString(),
+            valid_until: validUntil ? validUntil.toISOString() : null,
           },
         ];
       });

@@ -588,6 +588,50 @@ h1 {
 .vehicle-summary .badge {
   margin-left: auto;
 }
+.replacement-request-details {
+  flex: 1;
+  min-width: 0;
+}
+.replacement-request-details > small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+}
+.replacement-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 12px;
+  margin-top: 12px;
+}
+.replacement-form label {
+  flex: 1 1 150px;
+}
+.replacement-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.household-roster {
+  border-top: 1px solid var(--border);
+}
+.household-roster > .panel-heading {
+  background: #f8faf7;
+}
+.household-roster .vehicle-summary {
+  flex-wrap: wrap;
+}
+.household-roster .replacement-actions {
+  margin-left: auto;
+}
+.household-roster details {
+  padding: 12px 22px 18px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.household-roster summary {
+  cursor: pointer;
+}
 .gate-card .panel-heading > svg {
   color: #829f82;
 }
@@ -763,8 +807,21 @@ td small {
   color: var(--muted);
   margin-top: 5px;
 }
+.resident-details {
+  flex: 1;
+  min-width: 160px;
+}
+.resident-details small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
 .resident-row .badge {
   margin-left: auto;
+}
+.resident-row .button {
+  flex-shrink: 0;
 }
 .device-grid {
   display: grid;
@@ -1026,6 +1083,13 @@ label select {
   padding-top: 15px;
   border-top: 1px solid var(--border);
 }
+.button.destructive {
+  background: #a43832;
+  color: #fff;
+}
+.button.destructive:hover:not(:disabled) {
+  background: #862c27;
+}
 @media (min-width: 1600px) {
   .content {
     padding-top: 40px;
@@ -1097,6 +1161,17 @@ label select {
   }
   h1 {
     font-size: 25px;
+  }
+}
+@media (max-width: 760px) {
+  .resident-row {
+    flex-wrap: wrap;
+  }
+  .resident-row .resident-details {
+    flex: 1 1 calc(100% - 60px);
+  }
+  .resident-row .badge {
+    margin-left: 0;
   }
 }
 @media (max-width: 850px) {

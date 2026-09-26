@@ -6,7 +6,13 @@ import {
   UnauthorizedException,
 } from "@nestjs/common";
 import { randomUUID } from "node:crypto";
-import type { MembershipRole, MembershipSummary, Principal, Role } from "@smartgate/permissions";
+import type {
+  HouseholdRelationship,
+  MembershipRole,
+  MembershipSummary,
+  Principal,
+  Role,
+} from "@smartgate/permissions";
 import {
   hashPassword,
   newRecoveryCodes,
@@ -58,6 +64,11 @@ export function assertText(value: unknown, label: string, max = 100) {
   if (typeof value !== "string" || !value.trim() || value.trim().length > max)
     throw new BadRequestException("Invalid " + label);
   return value.trim();
+}
+export function assertRelationship(value: unknown): HouseholdRelationship {
+  if (value !== "owner" && value !== "tenant" && value !== "family_member" && value !== "occupant")
+    throw new BadRequestException("Invalid household relationship.");
+  return value;
 }
 /**
  * Identity owns users, memberships, sessions, invitations, and multi-factor state.
@@ -321,7 +332,16 @@ export class Identity {
     if (row.membership_id && row.membership_role === "resident")
       principal.properties = (
         await this.store.query(
-          "SELECT property_id FROM property_memberships WHERE membership_id=$1 AND ended_at IS NULL",
+          `SELECT pm.property_id
+           FROM property_memberships pm
+           JOIN property_occupancies o
+             ON o.organization_id=pm.organization_id AND o.id=pm.occupancy_id
+           WHERE pm.membership_id=$1 AND pm.ended_at IS NULL AND o.ended_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM scheduled_move_outs s
+               WHERE s.organization_id=pm.organization_id AND s.occupancy_id=pm.occupancy_id
+                AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+             )`,
           [row.membership_id],
         )
       ).rows.map((r) => r.property_id);
@@ -552,6 +572,7 @@ export class Identity {
       role: unknown;
       siteId?: unknown;
       propertyId?: unknown;
+      relationship?: unknown;
       organizationId?: unknown;
     },
   ) {
@@ -580,22 +601,74 @@ export class Identity {
     }
     const siteId = role === "guard" ? assertUuid(input.siteId, "site") : null;
     const propertyId = role === "resident" ? assertUuid(input.propertyId, "property") : null;
+    const relationship =
+      role === "resident" && input.relationship !== undefined
+        ? assertRelationship(input.relationship)
+        : null;
     if (siteId) await this.assertInOrganization("sites", siteId, organizationId);
     if (propertyId) await this.assertInOrganization("properties", propertyId, organizationId);
     const token = newToken();
     const id = randomUUID();
     await this.store.transaction(async (q) => {
+      if (propertyId) {
+        const property = (
+          await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+            propertyId,
+            organizationId,
+          ])
+        ).rows[0];
+        if (!property) throw new NotFoundException("That record is not in this organization.");
+        const cutoffDue = (
+          await q(
+            `SELECT 1 FROM scheduled_move_outs
+             WHERE organization_id=$1 AND property_id=$2 AND status='scheduled'
+               AND effective_at<=clock_timestamp() LIMIT 1`,
+            [organizationId, propertyId],
+          )
+        ).rows.length;
+        if (cutoffDue) throw new ConflictException("This household's scheduled move-out is due.");
+      }
+      const residentRelationship = propertyId
+        ? (relationship ??
+          ((
+            await q(
+              `SELECT 1 FROM property_memberships pm
+               JOIN property_occupancies o ON o.id=pm.occupancy_id
+               WHERE pm.organization_id=$1 AND pm.property_id=$2 AND pm.ended_at IS NULL
+                 AND o.ended_at IS NULL LIMIT 1`,
+              [organizationId, propertyId],
+            )
+          ).rows.length
+            ? "family_member"
+            : "owner"))
+        : null;
       await q(
-        `INSERT INTO invitations(id,organization_id,email,role,token_hash,invited_by,site_id,property_id,expires_at)
-         VALUES($1,$2,$3,$4,$5,$6,$7,$8, now()+interval '${INVITATION_DAYS} days')`,
-        [id, organizationId, email, role, tokenHash(token), principal.id, siteId, propertyId],
+        `INSERT INTO invitations(id,organization_id,email,role,token_hash,invited_by,site_id,property_id,resident_relationship,expires_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9, now()+interval '${INVITATION_DAYS} days')`,
+        [
+          id,
+          organizationId,
+          email,
+          role,
+          tokenHash(token),
+          principal.id,
+          siteId,
+          propertyId,
+          residentRelationship,
+        ],
       );
       await this.audit(q, {
         organizationId,
         actorId: principal.id,
         action: "invitation.created",
         entityId: id,
-        detail: { role, email, site_id: siteId, property_id: propertyId },
+        detail: {
+          role,
+          email,
+          site_id: siteId,
+          property_id: propertyId,
+          relationship: residentRelationship,
+        },
         supportGrantId: principal.supportGrantId,
       });
     });
@@ -626,7 +699,8 @@ export class Identity {
     if (!principal.organizationId) return [];
     return (
       await this.store.query(
-        `SELECT id, email, role, site_id, property_id, created_at, expires_at, accepted_at, revoked_at
+        `SELECT id, email, role, site_id, property_id, resident_relationship,
+                created_at, expires_at, accepted_at, revoked_at
          FROM invitations WHERE organization_id=$1 ORDER BY created_at DESC LIMIT 100`,
         [principal.organizationId],
       )
@@ -658,11 +732,12 @@ export class Identity {
   ) {
     if (typeof input.token !== "string" || !input.token)
       throw new BadRequestException("An invitation token is required.");
+    const invitationTokenHash = tokenHash(input.token);
     const invitation = (
       await this.store.query(
-        `SELECT id, organization_id, email, role, site_id, property_id FROM invitations
+        `SELECT id, organization_id, email, role, site_id, property_id,resident_relationship FROM invitations
          WHERE token_hash=$1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at>now()`,
-        [tokenHash(input.token)],
+        [invitationTokenHash],
       )
     ).rows[0];
     if (!invitation) throw new UnauthorizedException("That invitation is no longer valid.");
@@ -690,7 +765,28 @@ export class Identity {
       userId = existing?.id ?? randomUUID();
     }
     const membershipId = randomUUID();
+    let acceptedMembershipId: string | null = null;
     await this.store.transaction(async (q) => {
+      if (invitation.role === "resident" && invitation.property_id) {
+        const property = (
+          await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+            invitation.property_id,
+            invitation.organization_id,
+          ])
+        ).rows[0];
+        if (!property) throw new NotFoundException("Household not found.");
+      }
+      const validInvitation = (
+        await q(
+          `SELECT id FROM invitations
+           WHERE id=$1 AND token_hash=$2 AND accepted_at IS NULL AND revoked_at IS NULL
+             AND expires_at>now()
+           FOR UPDATE`,
+          [invitation.id, invitationTokenHash],
+        )
+      ).rows[0];
+      if (!validInvitation) throw new UnauthorizedException("That invitation is no longer valid.");
+
       if (existing) {
         if (passwordHash)
           await q(
@@ -712,15 +808,75 @@ export class Identity {
           [membershipId, invitation.organization_id, userId, invitation.role],
         )
       ).rows[0];
-      if (invitation.role === "resident" && invitation.property_id)
-        // Reactivating a previously revoked household must restore its membership, not silently
-        // leave the assignment ended and the resident with no scope.
-        await q(
-          `INSERT INTO property_memberships(id,organization_id,property_id,membership_id,relationship,is_primary_contact)
-           VALUES($1,$2,$3,$4,'owner',true)
-           ON CONFLICT (membership_id,property_id) DO UPDATE SET ended_at=NULL`,
-          [randomUUID(), invitation.organization_id, invitation.property_id, membership.id],
-        );
+      acceptedMembershipId = membership.id;
+      if (invitation.role === "resident" && invitation.property_id) {
+        const cutoffDue = (
+          await q(
+            `SELECT 1 FROM scheduled_move_outs
+             WHERE organization_id=$1 AND property_id=$2 AND status='scheduled'
+               AND effective_at<=clock_timestamp() LIMIT 1`,
+            [invitation.organization_id, invitation.property_id],
+          )
+        ).rows.length;
+        if (cutoffDue) throw new ConflictException("This household's scheduled move-out is due.");
+        let occupancy = (
+          await q(
+            "SELECT id FROM property_occupancies WHERE organization_id=$1 AND property_id=$2 AND ended_at IS NULL FOR UPDATE",
+            [invitation.organization_id, invitation.property_id],
+          )
+        ).rows[0];
+        if (!occupancy) {
+          occupancy = { id: randomUUID() };
+          await q(
+            "INSERT INTO property_occupancies(id,organization_id,property_id,started_at,resident_name_at_start,created_by) VALUES($1,$2,$3,now(),$4,$5)",
+            [occupancy.id, invitation.organization_id, invitation.property_id, name, userId],
+          );
+          await q("UPDATE properties SET resident_name=$1 WHERE id=$2 AND organization_id=$3", [
+            name,
+            invitation.property_id,
+            invitation.organization_id,
+          ]);
+        }
+        // Each occupancy gets its own resident-membership period. Returning residents can be
+        // re-invited without overwriting the prior period.
+        const hasPrimary = (
+          await q(
+            `SELECT 1 FROM property_memberships
+             WHERE organization_id=$1 AND occupancy_id=$2 AND ended_at IS NULL
+               AND is_primary_contact LIMIT 1`,
+            [invitation.organization_id, occupancy.id],
+          )
+        ).rows.length;
+        const propertyMembership = (
+          await q(
+            `INSERT INTO property_memberships(id,organization_id,property_id,membership_id,occupancy_id,relationship,is_primary_contact)
+             VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING RETURNING id`,
+            [
+              randomUUID(),
+              invitation.organization_id,
+              invitation.property_id,
+              membership.id,
+              occupancy.id,
+              invitation.resident_relationship ?? "owner",
+              !hasPrimary,
+            ],
+          )
+        ).rows[0];
+        if (!propertyMembership) {
+          const alreadyAssigned = (
+            await q(
+              `SELECT id FROM property_memberships
+               WHERE organization_id=$1 AND property_id=$2 AND occupancy_id=$3
+                 AND membership_id=$4 AND ended_at IS NULL LIMIT 1`,
+              [invitation.organization_id, invitation.property_id, occupancy.id, membership.id],
+            )
+          ).rows[0];
+          if (!alreadyAssigned)
+            throw new ConflictException(
+              "This resident already belongs to another household period.",
+            );
+        }
+      }
       if (invitation.role === "guard" && invitation.site_id)
         await q(
           `INSERT INTO site_assignments(id,organization_id,site_id,membership_id)
@@ -728,7 +884,16 @@ export class Identity {
            ON CONFLICT (membership_id,site_id) DO UPDATE SET revoked_at=NULL`,
           [randomUUID(), invitation.organization_id, invitation.site_id, membership.id],
         );
-      await q("UPDATE invitations SET accepted_at=now() WHERE id=$1", [invitation.id]);
+      const acceptedInvitation = (
+        await q(
+          `UPDATE invitations SET accepted_at=now()
+           WHERE id=$1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at>now()
+           RETURNING id`,
+          [invitation.id],
+        )
+      ).rows[0];
+      if (!acceptedInvitation)
+        throw new UnauthorizedException("That invitation is no longer valid.");
       await this.audit(q, {
         organizationId: invitation.organization_id,
         actorId: userId,
@@ -738,7 +903,7 @@ export class Identity {
       });
     });
     const memberships = await this.memberships(userId);
-    const scope = memberships.find((m) => m.organizationId === invitation.organization_id) ?? null;
+    const scope = memberships.find((m) => m.membershipId === acceptedMembershipId) ?? null;
     // An existing account keeps the verification state of the session that accepted the
     // invitation; a newly created account has no MFA yet.
     return {
@@ -757,6 +922,38 @@ export class Identity {
     if (row.id === principal.membershipId)
       throw new BadRequestException("You cannot revoke your own membership.");
     await this.store.transaction(async (q) => {
+      const propertyMemberships = (
+        await q(
+          `SELECT property_id FROM property_memberships
+           WHERE organization_id=$1 AND membership_id=$2 AND ended_at IS NULL
+           ORDER BY property_id`,
+          [principal.organizationId, row.id],
+        )
+      ).rows;
+      const propertyIds = propertyMemberships.map((membership: any) => membership.property_id);
+      if (propertyIds.length)
+        await q(
+          `SELECT id FROM properties
+           WHERE organization_id=$1 AND id=ANY($2::uuid[])
+           ORDER BY id FOR UPDATE`,
+          [principal.organizationId, propertyIds],
+        );
+      const currentMembership = (
+        await q(
+          `SELECT id FROM organization_memberships
+           WHERE id=$1 AND organization_id=$2 AND status='active' FOR UPDATE`,
+          [row.id, principal.organizationId],
+        )
+      ).rows[0];
+      if (!currentMembership) throw new NotFoundException("Active membership not found.");
+      const primaryOccupancies = (
+        await q(
+          `SELECT occupancy_id FROM property_memberships
+           WHERE organization_id=$1 AND membership_id=$2
+             AND ended_at IS NULL AND is_primary_contact`,
+          [principal.organizationId, row.id],
+        )
+      ).rows;
       await q(
         "UPDATE organization_memberships SET status='revoked', revoked_at=now() WHERE id=$1",
         [row.id],
@@ -764,13 +961,53 @@ export class Identity {
       // Revocation ends the household and station assignments too, so the scope is genuinely gone
       // rather than merely unreachable while the membership is revoked.
       await q(
-        "UPDATE property_memberships SET ended_at=now() WHERE membership_id=$1 AND ended_at IS NULL",
+        "UPDATE property_memberships SET ended_at=now(),is_primary_contact=false WHERE membership_id=$1 AND ended_at IS NULL",
         [row.id],
       );
+      for (const occupancy of primaryOccupancies) {
+        const next = (
+          await q(
+            `SELECT id FROM property_memberships
+             WHERE organization_id=$1 AND occupancy_id=$2 AND ended_at IS NULL
+             ORDER BY started_at,id LIMIT 1 FOR UPDATE`,
+            [principal.organizationId, occupancy.occupancy_id],
+          )
+        ).rows[0];
+        if (next)
+          await q("UPDATE property_memberships SET is_primary_contact=true WHERE id=$1", [next.id]);
+      }
       await q(
         "UPDATE site_assignments SET revoked_at=now() WHERE membership_id=$1 AND revoked_at IS NULL",
         [row.id],
       );
+      if (row.role === "resident") {
+        const canceledVehicleChanges = (
+          await q(
+            `UPDATE vehicle_change_requests
+             SET status='cancelled',decision_note='Resident membership revoked.',
+                 decided_by=$1,resolved_at=now()
+             WHERE organization_id=$2 AND requested_by=$3 AND status='pending'
+             RETURNING id,vehicle_id,occupancy_id`,
+            [principal.id, principal.organizationId, row.user_id],
+          )
+        ).rows;
+        for (const request of canceledVehicleChanges)
+          await q(
+            "INSERT INTO audit_events(id,organization_id,actor_id,action,entity_id,detail,support_grant_id) VALUES($1,$2,$3,'vehicle.change_cancelled',$4,$5,$6)",
+            [
+              randomUUID(),
+              principal.organizationId,
+              principal.id,
+              request.id,
+              JSON.stringify({
+                vehicle_id: request.vehicle_id,
+                occupancy_id: request.occupancy_id,
+                reason: "membership_revoked",
+              }),
+              principal.supportGrantId ?? null,
+            ],
+          );
+      }
       // Revocation must remove access immediately, including from live sessions.
       await q(
         "UPDATE sessions SET revoked_at=now(), revoke_reason='membership revoked' WHERE membership_id=$1 AND revoked_at IS NULL",
@@ -786,6 +1023,165 @@ export class Identity {
       });
     });
     return { ok: true };
+  }
+  async endPropertyMember(principal: Principal, propertyId: string, propertyMemberId: string) {
+    if (!principal.organizationId) throw new ForbiddenException("Select an organization first.");
+    return this.store.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          propertyId,
+          principal.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Household not found.");
+      const member = (
+        await q(
+          `SELECT pm.id,pm.occupancy_id,pm.is_primary_contact,m.user_id,u.email
+           FROM property_memberships pm
+           JOIN organization_memberships m ON m.id=pm.membership_id
+           JOIN users u ON u.id=m.user_id
+           JOIN property_occupancies o ON o.id=pm.occupancy_id
+           WHERE pm.id=$1 AND pm.organization_id=$2 AND pm.property_id=$3
+             AND pm.ended_at IS NULL AND o.ended_at IS NULL AND m.status='active'
+             AND m.role='resident'
+             AND NOT EXISTS (
+               SELECT 1 FROM scheduled_move_outs s
+               WHERE s.organization_id=pm.organization_id AND s.occupancy_id=pm.occupancy_id
+                 AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+             )
+           FOR UPDATE OF pm`,
+          [propertyMemberId, principal.organizationId, propertyId],
+        )
+      ).rows[0];
+      if (!member) throw new NotFoundException("Active household member not found.");
+      await q(
+        "UPDATE property_memberships SET ended_at=now(),is_primary_contact=false WHERE id=$1",
+        [member.id],
+      );
+      const revoked = (
+        await q(
+          `UPDATE invitations SET revoked_at=now()
+           WHERE organization_id=$1 AND property_id=$2 AND email=$3 AND role='resident'
+             AND accepted_at IS NULL AND revoked_at IS NULL RETURNING id`,
+          [principal.organizationId, propertyId, member.email],
+        )
+      ).rows;
+      for (const invitation of revoked)
+        await this.audit(q, {
+          organizationId: principal.organizationId!,
+          actorId: principal.id,
+          action: "invitation.revoked",
+          entityId: invitation.id,
+          detail: { reason: "household_member_ended", property_id: propertyId },
+          supportGrantId: principal.supportGrantId,
+        });
+      const canceledVehicleChanges = (
+        await q(
+          `UPDATE vehicle_change_requests
+           SET status='cancelled',decision_note='Household member access ended.',
+               decided_by=$1,resolved_at=now()
+           WHERE organization_id=$2 AND occupancy_id=$3 AND requested_by=$4
+             AND status='pending'
+           RETURNING id,vehicle_id`,
+          [principal.id, principal.organizationId, member.occupancy_id, member.user_id],
+        )
+      ).rows;
+      for (const request of canceledVehicleChanges)
+        await this.audit(q, {
+          organizationId: principal.organizationId!,
+          actorId: principal.id,
+          action: "vehicle.change_cancelled",
+          entityId: request.id,
+          detail: {
+            vehicle_id: request.vehicle_id,
+            occupancy_id: member.occupancy_id,
+            reason: "household_member_ended",
+          },
+          supportGrantId: principal.supportGrantId,
+        });
+      let nextPrimary: string | null = null;
+      if (member.is_primary_contact) {
+        const next = (
+          await q(
+            `SELECT id FROM property_memberships
+             WHERE organization_id=$1 AND occupancy_id=$2 AND ended_at IS NULL
+             ORDER BY started_at,id LIMIT 1 FOR UPDATE`,
+            [principal.organizationId, member.occupancy_id],
+          )
+        ).rows[0];
+        if (next) {
+          await q("UPDATE property_memberships SET is_primary_contact=true WHERE id=$1", [next.id]);
+          nextPrimary = next.id;
+        }
+      }
+      await this.audit(q, {
+        organizationId: principal.organizationId!,
+        actorId: principal.id,
+        action: "property.member_ended",
+        entityId: member.id,
+        detail: {
+          property_id: propertyId,
+          occupancy_id: member.occupancy_id,
+          user_id: member.user_id,
+          next_primary_id: nextPrimary,
+        },
+        supportGrantId: principal.supportGrantId,
+      });
+      return {
+        ok: true,
+        primary_member_id: nextPrimary,
+        canceled_vehicle_change_count: canceledVehicleChanges.length,
+      };
+    });
+  }
+  async setPrimaryContact(principal: Principal, propertyId: string, propertyMemberId: string) {
+    if (!principal.organizationId) throw new ForbiddenException("Select an organization first.");
+    return this.store.transaction(async (q) => {
+      const property = (
+        await q("SELECT id FROM properties WHERE id=$1 AND organization_id=$2 FOR UPDATE", [
+          propertyId,
+          principal.organizationId,
+        ])
+      ).rows[0];
+      if (!property) throw new NotFoundException("Household not found.");
+      const member = (
+        await q(
+          `SELECT pm.id,pm.occupancy_id,pm.is_primary_contact
+           FROM property_memberships pm
+           JOIN property_occupancies o ON o.id=pm.occupancy_id
+           WHERE pm.id=$1 AND pm.organization_id=$2 AND pm.property_id=$3
+             AND pm.ended_at IS NULL AND o.ended_at IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM scheduled_move_outs s
+               WHERE s.organization_id=pm.organization_id AND s.occupancy_id=pm.occupancy_id
+                 AND s.status='scheduled' AND s.effective_at<=clock_timestamp()
+             )
+             AND pm.membership_id IN (
+               SELECT id FROM organization_memberships
+               WHERE organization_id=$2 AND status='active' AND role='resident'
+             ) FOR UPDATE OF pm`,
+          [propertyMemberId, principal.organizationId, propertyId],
+        )
+      ).rows[0];
+      if (!member) throw new NotFoundException("Active household member not found.");
+      if (member.is_primary_contact) return { ok: true };
+      await q(
+        `UPDATE property_memberships SET is_primary_contact=false
+         WHERE organization_id=$1 AND occupancy_id=$2 AND ended_at IS NULL
+           AND is_primary_contact`,
+        [principal.organizationId, member.occupancy_id],
+      );
+      await q("UPDATE property_memberships SET is_primary_contact=true WHERE id=$1", [member.id]);
+      await this.audit(q, {
+        organizationId: principal.organizationId!,
+        actorId: principal.id,
+        action: "property.primary_contact_changed",
+        entityId: member.id,
+        detail: { property_id: propertyId, occupancy_id: member.occupancy_id },
+        supportGrantId: principal.supportGrantId,
+      });
+      return { ok: true };
+    });
   }
   async listMemberships(principal: Principal) {
     return (

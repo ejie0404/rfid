@@ -134,6 +134,62 @@ export class DomainController {
   @Get("snapshot") async snapshot(@Req() req: FastifyRequest) {
     return this.store.snapshot(await this.sessions.requireOrganization(req, "vehicle.read"));
   }
+  @Get("households") async households(@Req() req: FastifyRequest, @Query() query: any) {
+    const principal = await this.sessions.requireOrganization(req, "vehicle.read");
+    return this.store.pageHouseholds(principal, {
+      search: typeof query?.search === "string" ? query.search : "",
+      cursor: typeof query?.cursor === "string" ? query.cursor : undefined,
+      limit: query?.limit === undefined ? undefined : Number(query.limit),
+    });
+  }
+  @Get("properties/:propertyId/members") async householdMembers(
+    @Req() req: FastifyRequest,
+    @Param("propertyId") propertyId: string,
+    @Query() query: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "membership.manage");
+    const status = query?.status;
+    if (status !== undefined && status !== "active" && status !== "ended")
+      throw new BadRequestException("Choose active or ended household members.");
+    return this.store.pageHouseholdMembers(principal, assertUuid(propertyId, "property"), {
+      status,
+      cursor: typeof query?.cursor === "string" ? query.cursor : undefined,
+      limit: query?.limit === undefined ? undefined : Number(query.limit),
+    });
+  }
+  @Get("occupancies") async occupancies(@Req() req: FastifyRequest, @Query() query: any) {
+    const principal = await this.sessions.requireOrganization(req, "membership.manage");
+    const status = query?.status;
+    if (status !== undefined && status !== "active" && status !== "ended")
+      throw new BadRequestException("Choose active or ended occupancies.");
+    return this.store.pageOccupancies(principal, {
+      status,
+      propertyId: query?.property_id ? assertUuid(query.property_id, "property") : undefined,
+      cursor: typeof query?.cursor === "string" ? query.cursor : undefined,
+      limit: query?.limit === undefined ? undefined : Number(query.limit),
+    });
+  }
+  @Get("lifecycle-requests") async lifecycleRequests(
+    @Req() req: FastifyRequest,
+    @Query() query: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "vehicle.read");
+    const kind = query?.kind;
+    if (
+      !["vehicle_changes", "credential_replacements", "vehicle_retirements", "move_outs"].includes(
+        kind,
+      )
+    )
+      throw new BadRequestException("Choose a supported lifecycle record type.");
+    return this.store.pageLifecycleRequests(principal, {
+      kind,
+      status: typeof query?.status === "string" ? query.status : undefined,
+      propertyId: query?.property_id ? assertUuid(query.property_id, "property") : undefined,
+      search: typeof query?.search === "string" ? query.search : "",
+      cursor: typeof query?.cursor === "string" ? query.cursor : undefined,
+      limit: query?.limit === undefined ? undefined : Number(query.limit),
+    });
+  }
   @Post("enrollments") async enroll(@Req() req: FastifyRequest, @Body() body: any) {
     const principal = await this.sessions.requireOrganization(req, "enrollment.write");
     const format = body?.format ?? "epc";
@@ -173,11 +229,154 @@ export class DomainController {
     if (!["active", "suspended", "lost", "revoked"].includes(body?.status))
       throw new BadRequestException("Invalid status.");
     const role = effectiveRole(principal);
-    // Reporting your own tag lost is a separate permission from managing credentials.
-    const permission = body.status === "lost" ? "credential.report_lost" : "credential.manage";
-    if (!canAct(principal, permission)) throw new ForbiddenException();
+    if (body.status === "lost" && role === "resident")
+      return {
+        ok: true,
+        delivery: "pending_edge_acknowledgement",
+        acted_as: role,
+        ...(await this.store.reportLostCredential(principal, id)),
+      };
+    if (!canAct(principal, "credential.manage")) throw new ForbiddenException();
     await this.store.status(principal, id, body.status);
     return { ok: true, delivery: "pending_edge_acknowledgement", acted_as: role };
+  }
+  @Post("credential-requests") async reportLostCredential(
+    @Req() req: FastifyRequest,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.report_lost");
+    return this.store.reportLostCredential(
+      principal,
+      assertUuid(body?.credential_id, "credential"),
+    );
+  }
+  @Post("credential-requests/:id/issue") async issueCredentialReplacement(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    const format = body?.format ?? "epc";
+    if (!["epc", "wiegand26", "wiegand34"].includes(format))
+      throw new BadRequestException("Invalid credential format.");
+    const value = stringField(body?.value, "credential", 64).toUpperCase();
+    if (
+      !/^[0-9A-F]+$/.test(value) ||
+      (format === "epc" && value.length % 2 !== 0) ||
+      (format === "wiegand26" && value.length !== 6) ||
+      (format === "wiegand34" && value.length !== 8)
+    )
+      throw new BadRequestException("Credential must match the selected format.");
+    return this.store.issueCredentialReplacement(principal, assertUuid(id, "request"), {
+      format,
+      value,
+    });
+  }
+  @Post("credential-requests/:id/reject") async rejectCredentialReplacement(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    const note = body?.decision_note ?? "";
+    if (typeof note !== "string" || note.trim().length > 240)
+      throw new BadRequestException("The decision note must be 240 characters or fewer.");
+    return this.store.rejectCredentialReplacement(
+      principal,
+      assertUuid(id, "request"),
+      note.trim(),
+    );
+  }
+  @Post("vehicle-change-requests") async requestVehicleChange(
+    @Req() req: FastifyRequest,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "vehicle.change.request");
+    return this.store.requestVehicleChange(principal, assertUuid(body?.vehicle_id, "vehicle"), {
+      plate: stringField(body?.plate, "plate", 20).toUpperCase(),
+      make: stringField(body?.make, "make", 60),
+      color: stringField(body?.color, "color", 40),
+    });
+  }
+  @Post("vehicle-change-requests/:id/approve") async approveVehicleChange(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    const note = body?.decision_note ?? "";
+    if (typeof note !== "string" || note.trim().length > 240)
+      throw new BadRequestException("The decision note must be 240 characters or fewer.");
+    return this.store.approveVehicleChange(principal, assertUuid(id, "request"), note.trim());
+  }
+  @Post("vehicle-change-requests/:id/reject") async rejectVehicleChange(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    const note = stringField(body?.decision_note, "decision note", 240);
+    return this.store.rejectVehicleChange(principal, assertUuid(id, "request"), note);
+  }
+  @Post("vehicle-retirement-requests") async requestVehicleRetirement(
+    @Req() req: FastifyRequest,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "vehicle.retire.request");
+    const reason = body?.reason ?? "";
+    if (typeof reason !== "string" || reason.trim().length > 240)
+      throw new BadRequestException("The reason must be 240 characters or fewer.");
+    return this.store.requestVehicleRetirement(
+      principal,
+      assertUuid(body?.vehicle_id, "vehicle"),
+      reason.trim(),
+    );
+  }
+  @Post("vehicle-retirement-requests/:id/cancel") async cancelVehicleRetirement(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+  ) {
+    return this.store.cancelVehicleRetirement(
+      await this.sessions.requireOrganization(req, "vehicle.retire.request"),
+      assertUuid(id, "request"),
+    );
+  }
+  @Post("vehicle-retirement-requests/:id/approve") async approveVehicleRetirement(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    const note = body?.decision_note ?? "";
+    if (typeof note !== "string" || note.trim().length > 240)
+      throw new BadRequestException("The decision note must be 240 characters or fewer.");
+    return this.store.approveVehicleRetirement(principal, assertUuid(id, "request"), note.trim());
+  }
+  @Post("vehicle-retirement-requests/:id/reject") async rejectVehicleRetirement(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "credential.manage");
+    return this.store.rejectVehicleRetirement(
+      principal,
+      assertUuid(id, "request"),
+      stringField(body?.decision_note, "decision note", 240),
+    );
+  }
+  @Post("vehicles/:id/retire") async retireVehicle(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const reason = body?.reason ?? "";
+    if (typeof reason !== "string" || reason.trim().length > 240)
+      throw new BadRequestException("The reason must be 240 characters or fewer.");
+    return this.store.retireVehicle(
+      await this.sessions.requireOrganization(req, "credential.manage"),
+      assertUuid(id, "vehicle"),
+      reason.trim(),
+    );
   }
   @Get("invitations") async invitations(@Req() req: FastifyRequest) {
     return this.identity.listInvitations(
@@ -191,6 +390,7 @@ export class DomainController {
       role: body?.role,
       siteId: body?.site_id,
       propertyId: body?.property_id,
+      relationship: body?.relationship,
       organizationId: body?.organization_id,
     });
   }
@@ -239,6 +439,69 @@ export class DomainController {
       await this.sessions.requireOrganization(req, "membership.manage"),
       assertUuid(id, "membership"),
       body?.reason,
+    );
+  }
+  @Post("properties/:propertyId/members/:memberId/end") async endPropertyMember(
+    @Req() req: FastifyRequest,
+    @Param("propertyId") propertyId: string,
+    @Param("memberId") memberId: string,
+  ) {
+    return this.identity.endPropertyMember(
+      await this.sessions.requireOrganization(req, "membership.manage"),
+      assertUuid(propertyId, "property"),
+      assertUuid(memberId, "household member"),
+    );
+  }
+  @Post("properties/:propertyId/members/:memberId/primary") async setPrimaryContact(
+    @Req() req: FastifyRequest,
+    @Param("propertyId") propertyId: string,
+    @Param("memberId") memberId: string,
+  ) {
+    return this.identity.setPrimaryContact(
+      await this.sessions.requireOrganization(req, "membership.manage"),
+      assertUuid(propertyId, "property"),
+      assertUuid(memberId, "household member"),
+    );
+  }
+  @Post("properties/:id/move-out") async moveOut(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "membership.manage");
+    const reason = body?.reason ?? "";
+    if (typeof reason !== "string" || reason.trim().length > 240)
+      throw new BadRequestException("The reason must be 240 characters or fewer.");
+    return this.store.moveOut(principal, assertUuid(id, "property"), reason.trim());
+  }
+  @Post("properties/:id/move-out-schedule") async scheduleMoveOut(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+    @Body() body: any,
+  ) {
+    const principal = await this.sessions.requireOrganization(req, "membership.manage");
+    const reason = body?.reason ?? "";
+    if (typeof reason !== "string" || reason.trim().length > 240)
+      throw new BadRequestException("The reason must be 240 characters or fewer.");
+    if (
+      typeof body?.effective_at !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T.*(?:Z|[+-]\d{2}:\d{2})$/i.test(body.effective_at)
+    )
+      throw new BadRequestException("Use a date and time with an explicit time zone.");
+    return this.store.scheduleMoveOut(
+      principal,
+      assertUuid(id, "property"),
+      new Date(body.effective_at),
+      reason.trim(),
+    );
+  }
+  @Post("properties/:id/move-out-schedule/cancel") async cancelScheduledMoveOut(
+    @Req() req: FastifyRequest,
+    @Param("id") id: string,
+  ) {
+    return this.store.cancelScheduledMoveOut(
+      await this.sessions.requireOrganization(req, "membership.manage"),
+      assertUuid(id, "property"),
     );
   }
   @Get("controllers") async controllers(@Req() req: FastifyRequest) {

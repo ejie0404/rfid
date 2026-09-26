@@ -25,6 +25,12 @@ Demonstration sign-in is only offered because the API reports that it is enabled
 seeded account through the real login path, so it cannot reach anything the equivalent real account
 could not.
 
+The API also runs the scheduled move-out processor: it checks once at startup, then every 15 seconds.
+Start it through the normal API command; there is no separate worker command. Due work is rechecked
+inside the database transaction, so multiple API instances and process restarts can safely retry it.
+Failures are logged and retried on a later check. Apply the database migrations before starting the
+API against a real PostgreSQL database.
+
 ### Real accounts
 
 No fictional data, no demonstration shortcut. The first account is created by an operator, and

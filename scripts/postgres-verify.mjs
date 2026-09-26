@@ -20,21 +20,30 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../apps/api/dist/app.js";
+import { migrationFiles } from "../apps/api/dist/migrations.js";
 
 const adminUrl = process.env.SMARTGATE_PG_ADMIN_URL || "postgresql://127.0.0.1:5432/postgres";
 const host = new URL(adminUrl).hostname;
 const port = new URL(adminUrl).port || "5432";
-const migratorRole = "smartgate_verify_migrate";
-const appRole = "smartgate_verify_app";
+const runId = randomBytes(5).toString("hex");
+const migratorRole = `smartgate_verify_${runId}_migrate`;
+const appRole = `smartgate_verify_${runId}_app`;
 const migratorPassword = randomBytes(18).toString("base64url");
 const appPassword = randomBytes(18).toString("base64url");
 const databases = {
-  api: "smartgate_verify_api",
-  identity: "smartgate_verify_identity",
-  restoreSource: "smartgate_verify_restore_a",
-  restoreTarget: "smartgate_verify_restore_b",
+  api: `smartgate_verify_${runId}_api`,
+  identity: `smartgate_verify_${runId}_identity`,
+  replacement: `smartgate_verify_${runId}_replacement`,
+  occupancy: `smartgate_verify_${runId}_occupancy`,
+  household: `smartgate_verify_${runId}_household`,
+  lifecycle: `smartgate_verify_${runId}_lifecycle`,
+  unmigrated: `smartgate_verify_${runId}_unmigrated`,
+  partial: `smartgate_verify_${runId}_partial`,
+  restoreSource: `smartgate_verify_${runId}_restore_a`,
+  restoreTarget: `smartgate_verify_${runId}_restore_b`,
 };
-const created = [];
+const createdDatabases = [];
+const createdRoles = [];
 const workspace = mkdtempSync(join(tmpdir(), "smartgate-postgres-"));
 const steps = [];
 /** Starts the application once against DATABASE_URL to observe its startup decision. */
@@ -92,9 +101,8 @@ async function grantApplication(pool, database) {
   );
 }
 async function createDatabase(admin, database) {
-  await query(admin, `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
   await query(admin, `CREATE DATABASE ${database} OWNER ${migratorRole}`);
-  created.push(database);
+  createdDatabases.push(database);
 }
 async function prepare(admin, database) {
   await createDatabase(admin, database);
@@ -116,19 +124,20 @@ try {
   const version = (await query(admin, "SELECT version() AS version"))[0].version;
   console.log("  target: " + version.split(" on ")[0]);
 
-  for (const role of [migratorRole, appRole])
-    await query(
-      admin,
-      `DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='${role}') THEN CREATE ROLE ${role} LOGIN; END IF; END $$`,
-    );
-  await query(admin, `ALTER ROLE ${migratorRole} PASSWORD '${migratorPassword}'`);
-  await query(admin, `ALTER ROLE ${appRole} PASSWORD '${appPassword}'`);
+  await query(admin, `CREATE ROLE ${migratorRole} LOGIN PASSWORD '${migratorPassword}'`);
+  createdRoles.push(migratorRole);
+  await query(admin, `CREATE ROLE ${appRole} LOGIN PASSWORD '${appPassword}'`);
+  createdRoles.push(appRole);
   record("created separate migration and application roles", `${migratorRole}, ${appRole}`);
 
   // 1 and 2: migrate each database with the migration role, then grant data-only privileges.
   const migrationDetail = await prepare(admin, databases.api);
   record("applied tracked migrations with the migration role", migrationDetail);
   await prepare(admin, databases.identity);
+  await prepare(admin, databases.replacement);
+  await prepare(admin, databases.occupancy);
+  await prepare(admin, databases.household);
+  await prepare(admin, databases.lifecycle);
   await prepare(admin, databases.restoreSource);
   record("granted data-only privileges to the application role");
 
@@ -142,10 +151,15 @@ try {
   } finally {
     await historyPool.end();
   }
-  const expectedMigrations = 5;
-  if (recorded.length !== expectedMigrations)
+  const expectedMigrations = migrationFiles(
+    new URL("../database/migrations/", import.meta.url),
+  ).map((file) => file.version);
+  if (recorded.map((row) => row.version).join(",") !== expectedMigrations.join(","))
     throw new Error(
-      "Expected " + expectedMigrations + " recorded migrations, found " + recorded.length,
+      "Expected migrations " +
+        expectedMigrations.join(", ") +
+        ", found " +
+        recorded.map((row) => row.version).join(", "),
     );
   record("recorded migration history", recorded.map((row) => row.version).join(", "));
 
@@ -170,7 +184,7 @@ try {
       throw new Error("Migrations unexpectedly succeeded with the application role.");
     // ...and the application refuses to start when the schema is absent. The role is given
     // connection rights first so the failure can only be the missing schema, not permission.
-    const unmigrated = "smartgate_verify_unmigrated";
+    const unmigrated = databases.unmigrated;
     await createDatabase(admin, unmigrated);
     await query(admin, `GRANT CONNECT ON DATABASE ${unmigrated} TO ${appRole}`);
     const unmigratedPool = new Pool({
@@ -194,7 +208,7 @@ try {
 
     // A partially migrated database is refused too, so a database that is missing the identity
     // migration cannot start and then fail later during a sign-in.
-    const partial = "smartgate_verify_partial";
+    const partial = databases.partial;
     await createDatabase(admin, partial);
     await migrate(partial);
     const partialPool = new Pool({
@@ -227,6 +241,11 @@ try {
   const suites = [
     ["tests/api.test.mjs", databases.api],
     ["tests/identity.test.mjs", databases.identity],
+    ["tests/replacement.test.mjs", databases.replacement],
+    ["tests/occupancy.test.mjs", databases.occupancy],
+    ["tests/household-vehicle-changes.test.mjs", databases.household],
+    ["tests/lifecycle.test.mjs", databases.lifecycle],
+    ["tests/lifecycle-audit-regressions.test.mjs", databases.lifecycle],
   ];
   for (const [file, database] of suites) {
     const result = await run(process.execPath, ["--test", file], {
@@ -438,17 +457,34 @@ try {
   console.error("\nFAILED: " + (error instanceof Error ? error.message : error));
   process.exitCode = 1;
 } finally {
-  for (const database of created)
-    await query(admin, `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`).catch(() => {});
+  const cleanupFailures = [];
+  for (const database of createdDatabases) {
+    try {
+      await query(admin, `DROP DATABASE IF EXISTS ${database} WITH (FORCE)`);
+    } catch (error) {
+      cleanupFailures.push(`${database}: ${error.message}`);
+    }
+  }
+  for (const role of createdRoles.reverse()) {
+    try {
+      await query(admin, `DROP ROLE IF EXISTS ${role}`);
+    } catch (error) {
+      cleanupFailures.push(`${role}: ${error.message}`);
+    }
+  }
   await admin.end();
   rmSync(workspace, { recursive: true, force: true });
-  console.log(
-    "\nCleaned up " +
-      created.length +
-      " verification databases. The roles " +
-      migratorRole +
-      " and " +
-      appRole +
-      " remain;\nremove them with DROP ROLE once you no longer need them.",
-  );
+  if (cleanupFailures.length) {
+    process.exitCode = 1;
+    console.error(`Cleanup failed for run ${runId}:\n${cleanupFailures.join("\n")}`);
+  } else
+    console.log(
+      "\nCleaned up " +
+        createdDatabases.length +
+        " databases and " +
+        createdRoles.length +
+        " roles created by run " +
+        runId +
+        ".",
+    );
 }

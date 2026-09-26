@@ -1,10 +1,10 @@
 # SmartGate detailed implementation plan
 
-Updated 25 September 2026. Scope: one supervised resident RFID pilot at one subdivision gate, followed by a decision about expansion. The plan uses two repositories: `smartgate-platform` for the NestJS API, PostgreSQL schema, shared contracts, and the three Next.js apps; `smartgate-edge` for Go, SQLite, local authorization, guard asset serving, and hardware adapters. The platform owns the versioned cloud-to-edge protocol.
+Updated 26 September 2026. Scope: one supervised resident RFID pilot at one subdivision gate, followed by a decision about expansion. The plan uses two repositories: `smartgate-platform` for the NestJS API, PostgreSQL schema, shared contracts, and the three Next.js apps; `smartgate-edge` for Go, SQLite, local authorization, guard asset serving, and hardware adapters. The platform owns the versioned cloud-to-edge protocol.
 
 ## Current baseline and limits
 
-The local prototype has login, organization membership, invitation and MFA flows, HOA enrollment, homeowner status/loss reporting, a guard station view, a simulated edge decision engine, a durable event queue, and draft protocol schemas. This implementation pass adds signed-in invitation acceptance, HOA site/lane setup, one-time controller enrollment, per-controller credentials, lane-scoped cloud sync, controller status in the HOA and guard views, and edge-side identity with a required offline policy in real mode. The platform and edge checks are recorded in `implementation-status.md`; PostgreSQL verification is run against the current five-migration set before this plan is finalized. No Git remote, deployment, purchased hardware, or real gate actuation is confirmed.
+The local prototype has login, organization membership, invitation and MFA flows, HOA enrollment, homeowner status/loss reporting, a guard station view, a simulated edge decision engine, a durable event queue, and draft protocol schemas. This implementation pass adds signed-in invitation acceptance, HOA site/lane setup, one-time controller enrollment, per-controller credentials, lane-scoped cloud sync, controller status in the HOA and guard views, and edge-side identity with a required offline policy in real mode. The O1.4 implementation adds migrations through `012`; its PostgreSQL verifier could not connect in this environment, so only migrations `001`–`009` have recorded PostgreSQL 17.11 evidence. No Git remote, deployment, purchased hardware, or real gate actuation is confirmed.
 
 The real pilot path now uses enrolled controller identities and per-controller credentials; fixed demonstration IDs and the local simulator marker remain confined to demo mode. The guard web app is served locally by the edge, but offline guard sign-in and real barrier control are still open. The Hikvision models are integration targets, with exact Philippine SKUs, firmware, protocol, and wiring to confirm.
 
@@ -15,7 +15,7 @@ The real pilot path now uses enrolled controller identities and per-controller c
 | Account and app closure | A1 → A2           | Complete invitations; reviewable platform commit and PostgreSQL evidence | Current prototype                                              | A1 implemented; full browser matrix pending; A2 verification/commit done |
 | Device foundation       | D1 → D2 → D3 → D4 | Real site inventory, controller enrollment, scoped sync, fleet views     | A2                                                             | Software implemented; real-device exchange and rollout remain unproven   |
 | Hardware                | H1 → H2 → H3      | Confirmed Hikvision interface, bench driver, supervised lane             | H1 starts now; H2 needs device/interface evidence; H3 needs D4 | H1 blocked on exact regional hardware and installer evidence             |
-| Daily operations        | O1 and O2 → O3    | HOA/homeowner lifecycle and local guard workflows                        | A2; O3 also needs D4                                           | O1 and O2 partial; O3 not started                                        |
+| Daily operations        | O1 and O2 → O3    | HOA/homeowner lifecycle and local guard workflows                        | A2; O3 also needs D4                                           | O1.4 implemented; acceptance gaps remain; O2 partial; O3 not started     |
 | Deployment and pilot    | O3 → R1           | Reviewed deployment, then one supervised resident pilot                  | D4, H3, O1, O2                                                 | Not started; requires physical commissioning and operational sign-off    |
 
 Hardware discovery and the HOA/homeowner flows can progress while controller identity is built. Physical barrier actuation stays disabled until the installer approves the wiring and safety behavior.
@@ -73,7 +73,7 @@ Hardware discovery and the HOA/homeowner flows can progress while controller ide
 
 ## D3. Implement platform-side controller enrollment and scoped sync
 
-**Status:** implemented with hashed, single-use enrollment codes, per-controller credentials, revocation/rotation, and organization/site/lane-scoped config, event, and heartbeat handling. The final five-migration set passes the PostgreSQL rehearsal; deployment-level cross-process verification remains open.
+**Status:** implemented with hashed, single-use enrollment codes, per-controller credentials, revocation/rotation, and organization/site/lane-scoped config, event, and heartbeat handling. Migrations `001`–`009` and the replacement, occupancy, and household/vehicle-correction API suites passed the PostgreSQL 17.11 rehearsal. Legacy occupancy backfill scenarios passed embedded PostgreSQL tests. Deployment-level cross-process verification remains open.
 
 **Repository:** platform.
 
@@ -133,16 +133,18 @@ Obtain the reader/controller SDK or protocol, sanitized real event samples, EPC-
 
 ## O1. Complete HOA and homeowner lifecycle workflows
 
-**Status:** partial. Site/lane setup, controller monitoring, and adding another vehicle to an existing household are present. Dated occupancy, household people management, replacement requests, and per-controller delivery acknowledgement workflows remain.
+**Status:** O1.4 source implementation is complete; its full acceptance gate is not. Resident lost-tag replacement, vehicle correction, household roster, current-time move-out, per-vehicle retirement requests/direct HOA retirement, scheduled move-out create/change/cancel, a database-backed due-work processor, cutoff-aware resident scope, and cursor-paged household/lifecycle history are implemented. Migrations `010`–`012` add retirement, scheduling, and paging support. The edge now has regression coverage for persisted cutoff expiry and cancellation after SQLite restart. Local browser acceptance confirmed resident request/HOA approval, the management schedule/reschedule/cancel flow, immediate household-row refresh, a synced demo controller at configuration version 5, and denial of the retired RFID credential. Platform tests/builds and edge race tests pass. PostgreSQL verification for `010`–`012` was blocked by the local service refusing connection; phone-width browser acceptance and the remaining invitation/role, correction, and enrolled-controller cases are still open. The platform and edge exchanged data through their demo simulator processes; this is not a real enrolled-device or physical-gate acceptance.
 
 **Repository:** platform. **Can advance while D2-D4 run.**
 
-- Reuse an existing property for multiple vehicles and people. Represent ownership/tenancy start and end dates so move-outs, vehicle sales, and tag replacements preserve historical attribution.
-- Add explicit request/review states for homeowner vehicle corrections, lost tags, and replacement. Make an HOA decision auditable and show when each controller has acknowledged a changed credential.
+**Next development phase:** O2, the local guard workflow, once the remaining O1.4 acceptance evidence is recorded. See [the O1.4 implementation and acceptance record](o1-4-implementation-plan.md) for current gaps.
+
+- Reuse an existing property for multiple vehicles and people. `property_occupancies` records household periods and ties resident memberships and vehicles to the period. The HOA roster records each active or former resident, their relationship, and the current primary contact; removal ends that person’s access to the selected property only.
+- Extend the replacement workflow to homeowner vehicle corrections and other credential changes. Vehicle corrections are resident-submitted and HOA-approved or rejected; approvals update gate configuration only when the plate changes, and show when each affected controller acknowledges it.
 - Make the resident portal show its own household, credential and request status, and a privacy-scoped activity view. Confirm the flow on a phone browser with pilot households.
 - Give the HOA a reliable view of pending enrollments, stale gates, and exceptions. Company support may see fleet health only through its approved role and support grant.
 
-**Acceptance:** a homeowner reports loss, HOA staff replace the tag without reopening the old one, the resident sees progress, and an offline gate's pending delivery is clear. A move-out removes access while historical events remain attributable to the correct occupancy period.
+**Acceptance:** a homeowner reports loss, HOA staff replace the tag without reopening the old one, and the resident sees progress. HOA staff can manage household members per property and review vehicle corrections; the resident sees the decision and gate delivery status. An HOA move-out removes resident and vehicle access, makes pending invitations and corrections unusable, keeps prior events isolated from a later household, preserves the former household name, and shows when assigned gates apply the change. Confirm the flow on a phone browser before pilot use.
 
 ## O2. Complete the local guard workflow
 
