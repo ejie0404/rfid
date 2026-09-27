@@ -2,6 +2,8 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { createApp } from "../apps/api/dist/app.js";
+import { loadRuntimeConfig } from "../apps/api/dist/runtime-config.js";
+import { attemptRule, RequestAttemptLimiter } from "../apps/api/dist/request-limiter.js";
 import { IDS, DEMO_EDGE_TOKEN, validateProtocol } from "@smartgate/contracts";
 let app, store;
 const token = {};
@@ -33,6 +35,19 @@ test("authentication and permissions are enforced by API", async () => {
   assert.equal((await call("GET", "/snapshot", undefined, null)).statusCode, 401);
   assert.equal((await call("POST", "/enrollments", {}, "guard")).statusCode, 403);
   assert.equal((await call("POST", "/enrollments", {}, "resident")).statusCode, 403);
+  const preflight = await app.inject({
+    method: "OPTIONS",
+    url: "/snapshot",
+    headers: {
+      host: "localhost",
+      origin: "http://localhost:3000",
+      "access-control-request-method": "GET",
+      "access-control-request-headers": "authorization",
+    },
+  });
+  assert.equal(preflight.statusCode, 204);
+  assert.equal(preflight.headers["access-control-allow-origin"], "http://localhost:3000");
+  assert.match(preflight.headers["access-control-allow-headers"], /authorization/i);
   const rebinding = await app.inject({
     method: "GET",
     url: "/health",
@@ -246,15 +261,261 @@ test("resident can report own tag lost but cannot reactivate it", async () => {
     400,
   );
 });
-test("production mode refuses demonstration authentication", async () => {
-  const previous = process.env.NODE_ENV;
-  process.env.NODE_ENV = "production";
+test("production runtime configuration requires external PostgreSQL and exact deployment settings", () => {
+  const production = {
+    NODE_ENV: "production",
+    DATABASE_URL: "postgresql://smartgate:secret@db.example.test:5432/smartgate",
+    SMARTGATE_DEMO: "false",
+    SMARTGATE_SKIP_MIGRATIONS: "true",
+    HOST: "0.0.0.0",
+    PORT: "4100",
+    SMARTGATE_ALLOWED_ORIGINS: "https://control.example.test,https://guard.example.test",
+    SMARTGATE_ALLOWED_HOSTS: "api.example.test",
+    SMARTGATE_TRUSTED_PROXIES: "10.0.0.10",
+  };
+  const config = loadRuntimeConfig(production);
+  assert.equal(config.production, true);
+  assert.equal(config.demo, false);
+  assert.equal(config.host, "0.0.0.0");
+  assert.equal(config.port, 4100);
+  assert.deepEqual(config.allowedOrigins, [
+    "https://control.example.test",
+    "https://guard.example.test",
+  ]);
+  assert.deepEqual(config.allowedHosts, ["api.example.test"]);
+  assert.deepEqual(config.trustedProxies, ["10.0.0.10"]);
+
+  assert.throws(
+    () => loadRuntimeConfig({ ...production, DATABASE_URL: undefined }),
+    /DATABASE_URL is required/,
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ ...production, SMARTGATE_DEMO: "true" }),
+    /must be explicitly set to false/,
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ ...production, SMARTGATE_SKIP_MIGRATIONS: "false" }),
+    /must be true in production/,
+  );
+  assert.throws(
+    () =>
+      loadRuntimeConfig({
+        ...production,
+        SMARTGATE_ALLOWED_ORIGINS: "https://*.vercel.app",
+      }),
+    /exact origins/,
+  );
+  assert.throws(
+    () =>
+      loadRuntimeConfig({
+        ...production,
+        SMARTGATE_ALLOWED_ORIGINS: "http://control.example.test",
+      }),
+    /must use HTTPS/,
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ ...production, SMARTGATE_ALLOWED_HOSTS: "*" }),
+    /not wildcards/,
+  );
+  assert.throws(
+    () => loadRuntimeConfig({ ...production, SMARTGATE_TRUSTED_PROXIES: "10.0.0.0/8" }),
+    /individual IP addresses/,
+  );
+});
+
+test("health readiness checks database connectivity and schema without leaking failures", async () => {
+  const originalQuery = store.query;
+  store.query = async () => {
+    throw new Error("private database connection detail");
+  };
   try {
-    await assert.rejects(() => createApp(), /refuses production mode/);
+    const live = await call("GET", "/health/live", undefined, null);
+    const unavailable = await call("GET", "/health/ready", undefined, null);
+    assert.equal(live.statusCode, 200);
+    assert.equal(unavailable.statusCode, 503);
+    assert.doesNotMatch(unavailable.body, /private database connection detail|DATABASE_URL/);
   } finally {
-    if (previous === undefined) delete process.env.NODE_ENV;
-    else process.env.NODE_ENV = previous;
+    store.query = originalQuery;
   }
+
+  const migration = (
+    await store.query("SELECT version,checksum FROM schema_migrations ORDER BY version LIMIT 1")
+  ).rows[0];
+  assert.ok(migration);
+  await store.query("UPDATE schema_migrations SET checksum='mismatch' WHERE version=$1", [
+    migration.version,
+  ]);
+  try {
+    const mismatched = await call("GET", "/health/ready", undefined, null);
+    assert.equal(mismatched.statusCode, 503);
+    assert.doesNotMatch(mismatched.body, /checksum|migration|DATABASE_URL/);
+  } finally {
+    await store.query("UPDATE schema_migrations SET checksum=$2 WHERE version=$1", [
+      migration.version,
+      migration.checksum,
+    ]);
+  }
+});
+
+test("production mode refuses incomplete configuration before opening the database", async () => {
+  const previous = { ...process.env };
+  process.env.NODE_ENV = "production";
+  delete process.env.DATABASE_URL;
+  try {
+    await assert.rejects(() => createApp(), /DATABASE_URL is required in production/);
+  } finally {
+    for (const key of Object.keys(process.env)) if (!(key in previous)) delete process.env[key];
+    Object.assign(process.env, previous);
+  }
+});
+
+/** Creates an isolated test app whose runtime configuration reads temporary environment values. */
+async function createConfiguredApp(overrides) {
+  const saved = new Map(Object.keys(overrides).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, overrides);
+  try {
+    return await createApp({ test: true });
+  } finally {
+    for (const [name, value] of saved) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+}
+
+test("public controller enrollment attempts are bounded per source IP", async () => {
+  const isolated = await createApp({ test: true });
+  const attempt = (url, remoteAddress = "127.0.0.1") =>
+    isolated.app.inject({
+      method: "POST",
+      url,
+      remoteAddress,
+      headers: { host: "localhost" },
+      payload: {},
+    });
+  // The router sends each spelling to the same handler, so they must share one limit.
+  const spellings = [
+    "/edge/v1/enrollment/claim",
+    "/edge/v1/enrollment/cl%61im",
+    "/edge/v1/%65nrollment/claim?retry=1",
+  ];
+  try {
+    for (let count = 0; count < 8; count++)
+      assert.equal(
+        (await attempt(spellings[count % spellings.length])).statusCode,
+        400,
+        `attempt ${count + 1} reaches the enrollment handler`,
+      );
+    for (const url of spellings) {
+      const limited = await attempt(url);
+      assert.equal(limited.statusCode, 429, url);
+      assert.ok(Number(limited.headers["retry-after"]) > 0);
+      assert.doesNotMatch(limited.body, /credential|DATABASE_URL/);
+    }
+    assert.equal((await attempt(spellings[1], "127.0.0.2")).statusCode, 400);
+  } finally {
+    await isolated.app.close();
+    await isolated.store.close();
+  }
+});
+
+test("sign-in attempts share one limit across equivalent request paths", async () => {
+  const isolated = await createApp({ test: true });
+  const attempt = (url) =>
+    isolated.app.inject({
+      method: "POST",
+      url,
+      remoteAddress: "127.0.0.1",
+      headers: { host: "localhost" },
+      // No account is named, so the handler refuses each attempt without touching lockout state.
+      payload: {},
+    });
+  const spellings = ["/auth/login", "/auth/log%69n", "/auth/%6cogin", "/auth/login?next=/x"];
+  try {
+    for (let count = 0; count < 30; count++)
+      assert.equal(
+        (await attempt(spellings[count % spellings.length])).statusCode,
+        400,
+        `attempt ${count + 1} reaches the sign-in handler`,
+      );
+    for (const url of spellings) assert.equal((await attempt(url)).statusCode, 429, url);
+  } finally {
+    await isolated.app.close();
+    await isolated.store.close();
+  }
+});
+
+test("a configured proxy is recognized in every equivalent address spelling", async () => {
+  const isolated = await createConfiguredApp({
+    SMARTGATE_ALLOWED_HOSTS: "api.example.test",
+    // Mapped, plain IPv4, and uppercase expanded IPv6 spellings are all valid configuration.
+    SMARTGATE_TRUSTED_PROXIES: "::ffff:10.0.0.10,10.0.0.20,2001:DB8:0:0:0:0:0:1",
+  });
+  const fromPeer = (remoteAddress) =>
+    isolated.app.inject({
+      method: "GET",
+      url: "/health/live",
+      remoteAddress,
+      headers: { host: "internal.example.test:4100", "x-forwarded-host": "api.example.test" },
+    });
+  try {
+    // Sockets report IPv4 peers in plain or mapped form and IPv6 peers in compressed form.
+    for (const peer of ["10.0.0.10", "::ffff:10.0.0.10", "::ffff:10.0.0.20", "2001:db8::1"])
+      assert.equal((await fromPeer(peer)).statusCode, 200, `${peer} is a configured proxy`);
+    // Any other peer, including the distinct IPv4-compatible address, cannot set the public Host.
+    for (const peer of ["10.0.0.11", "::10.0.0.10", "2001:db8::2", "127.0.0.1"])
+      assert.equal((await fromPeer(peer)).statusCode, 403, `${peer} is not a configured proxy`);
+
+    // Client-IP attribution for attempt limits makes the same trust decision.
+    const claim = (remoteAddress, client) =>
+      isolated.app.inject({
+        method: "POST",
+        url: "/edge/v1/enrollment/claim",
+        remoteAddress,
+        headers: { host: "api.example.test", "x-forwarded-for": client },
+        payload: {},
+      });
+    for (let count = 0; count < 9; count++)
+      assert.equal(
+        (await claim("2001:db8::1", `203.0.113.${count + 1}`)).statusCode,
+        400,
+        "each client behind a configured proxy has its own budget",
+      );
+    for (let count = 0; count < 8; count++)
+      assert.equal((await claim("::10.0.0.10", `198.51.100.${count + 1}`)).statusCode, 400);
+    assert.equal(
+      (await claim("::10.0.0.10", "198.51.100.99")).statusCode,
+      429,
+      "an untrusted peer is limited by its own address whatever it forwards",
+    );
+  } finally {
+    await isolated.app.close();
+    await isolated.store.close();
+  }
+});
+
+test("attempt limiter resets an exhausted bucket when its window ends", () => {
+  let now = 1_000;
+  const limiter = new RequestAttemptLimiter(() => now);
+  assert.deepEqual(limiter.take("login:127.0.0.1", 1, 1_000), { allowed: true });
+  assert.deepEqual(limiter.take("login:127.0.0.1", 1, 1_000), {
+    allowed: false,
+    retryAfterSeconds: 1,
+  });
+  now += 1_000;
+  assert.deepEqual(limiter.take("login:127.0.0.1", 1, 1_000), { allowed: true });
+});
+
+test("sensitive public routes share bounded attempt policies", () => {
+  assert.equal(attemptRule("POST", "/auth/login")?.name, "identity-login");
+  assert.equal(attemptRule("POST", "/auth/mfa/verify")?.name, "identity-mfa");
+  assert.equal(attemptRule("POST", "/setup/operator")?.maximum, 5);
+  assert.equal(attemptRule("POST", "/auth/invitations/accept")?.maximum, 20);
+  assert.equal(attemptRule("POST", "/edge/v1/enrollment/claim")?.maximum, 8);
+  assert.equal(attemptRule("POST", "/invitations"), undefined);
+  assert.equal(attemptRule("POST", "/enrollments"), undefined);
+  assert.equal(attemptRule("GET", "/auth/login"), undefined);
+  assert.equal(attemptRule("POST", undefined), undefined, "an unmatched request has no handler");
 });
 
 test("village administrators can create organization-scoped sites and lanes", async () => {

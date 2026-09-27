@@ -1,11 +1,12 @@
 /** Verifies the real PostgreSQL path (implementation plan, step 3).
  *
- * It performs four things a PGlite run cannot:
+ * It performs five things a PGlite run cannot:
  *   1. Creates separate migration and application roles and proves the application role cannot
  *      change the schema.
  *   2. Applies the tracked migrations with the migration role.
  *   3. Runs the platform test suites against real PostgreSQL, each suite in its own database.
- *   4. Rehearses backup and restore, then checks that memberships, configuration versions,
+ *   4. Runs the standalone scheduled-work process across the PostgreSQL pool's idle window.
+ *   5. Rehearses backup and restore, then checks that memberships, configuration versions,
  *      users, and access events survive.
  *
  * It also checks that a migration modified after it was applied is refused.
@@ -33,10 +34,12 @@ const appPassword = randomBytes(18).toString("base64url");
 const databases = {
   api: `smartgate_verify_${runId}_api`,
   identity: `smartgate_verify_${runId}_identity`,
+  onboarding: `smartgate_verify_${runId}_onboarding`,
   replacement: `smartgate_verify_${runId}_replacement`,
   occupancy: `smartgate_verify_${runId}_occupancy`,
   household: `smartgate_verify_${runId}_household`,
   lifecycle: `smartgate_verify_${runId}_lifecycle`,
+  worker: `smartgate_verify_${runId}_worker`,
   unmigrated: `smartgate_verify_${runId}_unmigrated`,
   partial: `smartgate_verify_${runId}_partial`,
   restoreSource: `smartgate_verify_${runId}_restore_a`,
@@ -62,7 +65,10 @@ function record(name, detail) {
 }
 function run(command, args, env = {}, cwd = process.cwd()) {
   return new Promise((resolve) => {
-    const child = spawn(command, args, { env: { ...process.env, ...env }, cwd });
+    const child = spawn(command, args, {
+      env: { ...process.env, ...env },
+      cwd,
+    });
     let output = "";
     child.stdout.on("data", (chunk) => (output += chunk));
     child.stderr.on("data", (chunk) => (output += chunk));
@@ -118,6 +124,263 @@ async function prepare(admin, database) {
   }
   return detail;
 }
+async function verifyWorkerAcrossIdleWindow(database) {
+  const envKeys = [
+    "NODE_ENV",
+    "HOST",
+    "PORT",
+    "DATABASE_URL",
+    "SMARTGATE_DEMO",
+    "SMARTGATE_SKIP_MIGRATIONS",
+    "SMARTGATE_ALLOWED_ORIGINS",
+    "SMARTGATE_ALLOWED_HOSTS",
+    "SMARTGATE_TRUSTED_PROXIES",
+  ];
+  const originalEnvironment = new Map(envKeys.map((key) => [key, process.env[key]]));
+  const workers = [];
+  let workerPool;
+  let idleWindowSchedule;
+  let restartSchedule;
+  const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+  const storeScheduleDueInSeconds = (schedule, seconds) =>
+    query(
+      workerPool,
+      "UPDATE scheduled_move_outs SET effective_at=clock_timestamp()+($2::int*interval '1 second') WHERE id=$1 AND status='scheduled'",
+      [schedule.scheduleId, seconds],
+    );
+  const workerExited = ({ child }) => child.exitCode !== null || child.signalCode !== null;
+  /** Reads rows directly from the parent, so no API request can perform the scheduled work. */
+  const waitForCompletion = async (schedule, milliseconds, activeWorkers) => {
+    const deadline = Date.now() + milliseconds;
+    let completed;
+    while (Date.now() < deadline) {
+      if (activeWorkers.some(workerExited))
+        throw new Error("A standalone worker exited before processing the due schedule.");
+      completed = await query(
+        workerPool,
+        `SELECT s.status,s.executed_by,s.effective_at,o.ended_at,o.ended_by
+         FROM scheduled_move_outs s
+         JOIN property_occupancies o ON o.id=s.occupancy_id
+         WHERE s.id=$1`,
+        [schedule.scheduleId],
+      );
+      if (completed[0]?.status === "completed") break;
+      await delay(250);
+    }
+    if (completed?.[0]?.status !== "completed")
+      throw new Error("The standalone PostgreSQL worker did not complete its due schedule.");
+    if (
+      completed[0].executed_by !== "system:scheduled-move-out" ||
+      new Date(completed[0].ended_at).toISOString() !==
+        new Date(completed[0].effective_at).toISOString()
+    )
+      throw new Error("The worker did not preserve the scheduled cutoff and system attribution.");
+  };
+  const auditCount = async (schedule) =>
+    Number(
+      (
+        await query(
+          workerPool,
+          "SELECT count(*)::int AS count FROM audit_events WHERE action='property.occupancy_ended' AND entity_id=$1",
+          [schedule.occupancyId],
+        )
+      )[0].count,
+    );
+  const stopWorker = (worker, stopSignal = "SIGTERM") =>
+    new Promise((resolve, reject) => {
+      const { child } = worker;
+      if (child.exitCode !== null || child.signalCode !== null) {
+        if (child.exitCode === 0 && child.signalCode === null) resolve();
+        else reject(new Error("Standalone worker exited unexpectedly."));
+        return;
+      }
+      const safetyKill = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      child.once("close", (code, signal) => {
+        clearTimeout(safetyKill);
+        if (code === 0 && signal === null) resolve();
+        else
+          reject(
+            new Error(
+              "Standalone worker did not stop cleanly: " +
+                worker.output().replace(/postgres(?:ql)?:\/\/[^\s]+/gi, "[database URL]"),
+            ),
+          );
+      });
+      child.kill(stopSignal);
+    });
+  try {
+    const productionEnvironment = {
+      NODE_ENV: "production",
+      HOST: "0.0.0.0",
+      PORT: "4100",
+      DATABASE_URL: appUrl(database),
+      SMARTGATE_DEMO: "false",
+      SMARTGATE_SKIP_MIGRATIONS: "true",
+      SMARTGATE_ALLOWED_ORIGINS: "https://control.verify.invalid",
+      SMARTGATE_ALLOWED_HOSTS: "api.verify.invalid",
+      SMARTGATE_TRUSTED_PROXIES: "",
+    };
+    Object.assign(process.env, productionEnvironment);
+
+    const { app, store, identity } = await createApp();
+    const suffix = randomBytes(4).toString("hex");
+    const password = randomBytes(18).toString("base64url");
+    const call = (method, path, body, token) =>
+      app.inject({
+        method,
+        url: path,
+        headers: {
+          host: "api.verify.invalid",
+          ...(token ? { authorization: "Bearer " + token } : {}),
+        },
+        ...(body === undefined ? {} : { payload: body }),
+      });
+    try {
+      const operatorEmail = `worker-operator-${suffix}@verify.example`;
+      await identity.createOperator({
+        email: operatorEmail,
+        name: "Worker verification operator",
+        password,
+      });
+      const operatorLogin = await call("POST", "/auth/login", {
+        email: operatorEmail,
+        password,
+      });
+      if (operatorLogin.statusCode !== 201)
+        throw new Error("Worker verification operator login failed.");
+
+      const organizationId = randomUUID();
+      await store.query(
+        "INSERT INTO organizations(id,name) VALUES($1,'Worker verification village')",
+        [organizationId],
+      );
+      const invitation = await call(
+        "POST",
+        "/invitations",
+        {
+          email: `worker-hoa-${suffix}@verify.example`,
+          role: "hoa_admin",
+          organization_id: organizationId,
+        },
+        operatorLogin.json().token,
+      );
+      if (invitation.statusCode !== 201) throw new Error("Worker verification invitation failed.");
+      const accepted = await call("POST", "/auth/invitations/accept", {
+        token: invitation.json().token,
+        name: "Worker verification administrator",
+        password,
+      });
+      if (accepted.statusCode !== 201)
+        throw new Error("Worker verification invitation acceptance failed.");
+
+      /** Enrolls one household and schedules its move-out well after the verification window. */
+      const scheduleHouseholdMoveOut = async (platePrefix) => {
+        const enrollment = await call(
+          "POST",
+          "/enrollments",
+          {
+            resident: "Worker verification resident " + platePrefix,
+            property: "Worker verification home " + platePrefix,
+            plate: `${platePrefix}${suffix.slice(0, 5).toUpperCase()}`,
+            make: "Verification vehicle",
+            color: "Blue",
+            format: "epc",
+            value: randomBytes(12).toString("hex").toUpperCase(),
+          },
+          accepted.json().token,
+        );
+        if (enrollment.statusCode !== 201)
+          throw new Error("Worker verification household setup failed.");
+
+        const schedule = await call(
+          "POST",
+          `/properties/${enrollment.json().property_id}/move-out-schedule`,
+          {
+            effective_at: new Date(Date.now() + 20 * 60_000).toISOString(),
+            reason: "PostgreSQL worker verification",
+          },
+          accepted.json().token,
+        );
+        if (schedule.statusCode !== 201)
+          throw new Error("Worker verification schedule setup failed.");
+        return {
+          scheduleId: schedule.json().schedule_id,
+          occupancyId: schedule.json().occupancy_id,
+        };
+      };
+      idleWindowSchedule = await scheduleHouseholdMoveOut("WRK");
+      restartSchedule = await scheduleHouseholdMoveOut("WRR");
+    } finally {
+      await app.close();
+      await store.close();
+    }
+
+    const workerEnvironment = {
+      ...process.env,
+      ...productionEnvironment,
+    };
+    const startWorker = () => {
+      const child = spawn(process.execPath, ["apps/api/dist/move-out-worker-main.js"], {
+        cwd: process.cwd(),
+        env: workerEnvironment,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stdout.on("data", (chunk) => (output += chunk));
+      child.stderr.on("data", (chunk) => (output += chunk));
+      const worker = { child, output: () => output };
+      workers.push(worker);
+      return worker;
+    };
+
+    workerPool = new Pool({ connectionString: appUrl(database), max: 1 });
+    await storeScheduleDueInSeconds(idleWindowSchedule, 12);
+    const firstWorkers = [startWorker(), startWorker()];
+    await delay(11_000);
+    if (firstWorkers.some(workerExited))
+      throw new Error("A standalone worker exited during the PostgreSQL pool idle window.");
+
+    await storeScheduleDueInSeconds(idleWindowSchedule, 1);
+    await waitForCompletion(idleWindowSchedule, 12_000, firstWorkers);
+
+    // Both shutdown signals must take the entrypoint's shared drain-and-release path.
+    await Promise.all([
+      stopWorker(firstWorkers[0], "SIGINT"),
+      stopWorker(firstWorkers[1], "SIGTERM"),
+    ]);
+    if ((await auditCount(idleWindowSchedule)) !== 1)
+      throw new Error("The due schedule did not create exactly one occupancy audit record.");
+
+    // Only the restarted worker is running, so completing newly due work proves it ran a pass.
+    await storeScheduleDueInSeconds(restartSchedule, 0);
+    const restarted = startWorker();
+    await waitForCompletion(restartSchedule, 8_000, [restarted]);
+    await stopWorker(restarted, "SIGTERM");
+    if ((await auditCount(idleWindowSchedule)) !== 1)
+      throw new Error("Restarting the worker duplicated the completed move-out audit record.");
+    if ((await auditCount(restartSchedule)) !== 1)
+      throw new Error("The restarted worker did not create exactly one occupancy audit record.");
+
+    record(
+      "standalone PostgreSQL workers survived the idle window and processed due work",
+      "two entrypoints stopped by SIGINT and SIGTERM, one cutoff and audit per schedule, restarted worker completed new work without duplicates",
+    );
+  } finally {
+    if (workerPool) await workerPool.end();
+    await Promise.all(
+      workers.map((worker) =>
+        stopWorker(worker).catch(() => {
+          if (worker.child.exitCode === null && worker.child.signalCode === null)
+            worker.child.kill("SIGKILL");
+        }),
+      ),
+    );
+    for (const [key, value] of originalEnvironment) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
 const admin = new Pool({ connectionString: adminUrl, max: 1 });
 try {
   console.log("PostgreSQL path verification\n");
@@ -134,10 +397,12 @@ try {
   const migrationDetail = await prepare(admin, databases.api);
   record("applied tracked migrations with the migration role", migrationDetail);
   await prepare(admin, databases.identity);
+  await prepare(admin, databases.onboarding);
   await prepare(admin, databases.replacement);
   await prepare(admin, databases.occupancy);
   await prepare(admin, databases.household);
   await prepare(admin, databases.lifecycle);
+  await prepare(admin, databases.worker);
   await prepare(admin, databases.restoreSource);
   record("granted data-only privileges to the application role");
 
@@ -164,7 +429,10 @@ try {
   record("recorded migration history", recorded.map((row) => row.version).join(", "));
 
   // 3: prove the application role cannot change the schema.
-  const application = new Pool({ connectionString: appUrl(databases.api), max: 1 });
+  const application = new Pool({
+    connectionString: appUrl(databases.api),
+    max: 1,
+  });
   try {
     let refused = "";
     try {
@@ -241,6 +509,8 @@ try {
   const suites = [
     ["tests/api.test.mjs", databases.api],
     ["tests/identity.test.mjs", databases.identity],
+    // Real pooled connections make the concurrent village-creation check genuinely concurrent.
+    ["tests/village-onboarding.test.mjs", databases.onboarding],
     ["tests/replacement.test.mjs", databases.replacement],
     ["tests/occupancy.test.mjs", databases.occupancy],
     ["tests/household-vehicle-changes.test.mjs", databases.household],
@@ -259,16 +529,23 @@ try {
       throw new Error(file + " failed against PostgreSQL:\n" + result.output.slice(-4000));
     record(file + " passed against PostgreSQL", passed + " tests on " + database);
   }
+  await verifyWorkerAcrossIdleWindow(databases.worker);
 
   // 5: backup and restore rehearsal on a database holding representative state.
   process.env.SMARTGATE_SKIP_MIGRATIONS = "true";
   process.env.DATABASE_URL = appUrl(databases.restoreSource);
-  const { app, store, identity } = await createApp({ test: false, demo: false });
+  const { app, store, identity } = await createApp({
+    test: false,
+    demo: false,
+  });
   const call = (method, path, body, token) =>
     app.inject({
       method,
       url: path,
-      headers: { host: "localhost", ...(token ? { authorization: "Bearer " + token } : {}) },
+      headers: {
+        host: "localhost",
+        ...(token ? { authorization: "Bearer " + token } : {}),
+      },
       ...(body === undefined ? {} : { payload: body }),
     });
   let expected;
@@ -292,7 +569,11 @@ try {
     const invitation = await call(
       "POST",
       "/invitations",
-      { email: "hoa@verify.example", role: "hoa_admin", organization_id: organizationId },
+      {
+        email: "hoa@verify.example",
+        role: "hoa_admin",
+        organization_id: organizationId,
+      },
       platformToken,
     );
     const accepted = await call("POST", "/auth/invitations/accept", {
@@ -419,7 +700,10 @@ try {
       method: "POST",
       url: "/auth/login",
       headers: { host: "localhost" },
-      payload: { email: "operator@verify.example", password: expected.password },
+      payload: {
+        email: "operator@verify.example",
+        password: expected.password,
+      },
     });
     if (login.statusCode !== 201)
       throw new Error("An operator restored from backup could not sign in.");

@@ -2,7 +2,7 @@ import { Body, Controller, Get, Inject, Param, Post, Query, Req } from "@nestjs/
 import {
   BadRequestException,
   ForbiddenException,
-  HttpException,
+  ServiceUnavailableException,
   UnauthorizedException,
 } from "@nestjs/common";
 import type { FastifyRequest } from "fastify";
@@ -11,6 +11,9 @@ import { canAct } from "@smartgate/permissions";
 import { Identity, assertUuid } from "./identity.js";
 import { Sessions, bearer, effectiveRole, sessionMeta } from "./session.js";
 import { Store } from "./store.js";
+
+/** Account routes stay reachable while a privileged account is limited to MFA enrollment. */
+const MFA_SETUP = { allowDuringMfaSetup: true } as const;
 
 function stringField(value: unknown, label: string, max = 100) {
   if (typeof value !== "string" || !value.trim() || value.trim().length > max)
@@ -24,7 +27,19 @@ export class HealthController {
     @Inject(Store) private readonly store: Store,
     @Inject(Identity) private readonly identity: Identity,
   ) {}
+  @Get("health/live") liveness() {
+    return { status: "ok" };
+  }
+  @Get("health/ready") async readiness() {
+    try {
+      await this.store.checkReady();
+    } catch {
+      throw new ServiceUnavailableException("Service not ready");
+    }
+    return { status: "ready" };
+  }
   @Get("health") async health() {
+    await this.readiness();
     return {
       status: "ok",
       protocol: 1,
@@ -70,15 +85,19 @@ export class AuthController {
     return this.identity.verifyMfa(body?.challenge, body?.code, sessionMeta(req));
   }
   @Get("session") async session(@Req() req: FastifyRequest) {
-    const principal = await this.sessions.require(req);
-    return { principal, memberships: await this.identity.memberships(principal.id) };
+    const principal = await this.sessions.require(req, undefined, MFA_SETUP);
+    return {
+      principal,
+      memberships: await this.identity.memberships(principal.id),
+      mfa_setup_required: this.identity.mfaSetupRequired(principal),
+    };
   }
   @Post("logout") async logout(@Req() req: FastifyRequest) {
     return this.identity.logout(bearer(req));
   }
   @Post("scope") scope(@Req() req: FastifyRequest, @Body() body: any) {
     return this.sessions
-      .require(req)
+      .require(req, undefined, MFA_SETUP)
       .then((principal) =>
         this.identity.scopeSession(
           principal,
@@ -88,24 +107,27 @@ export class AuthController {
       );
   }
   @Post("password") async changePassword(@Req() req: FastifyRequest, @Body() body: any) {
-    const principal = await this.sessions.require(req);
+    const principal = await this.sessions.require(req, undefined, MFA_SETUP);
     return this.identity.changePassword(principal, body?.current_password, body?.new_password);
   }
   @Post("mfa/enroll") async enrollMfa(@Req() req: FastifyRequest) {
-    return this.identity.beginMfaEnrollment(await this.sessions.require(req));
+    return this.identity.beginMfaEnrollment(await this.sessions.require(req, undefined, MFA_SETUP));
   }
   @Post("mfa/confirm") async confirmMfa(@Req() req: FastifyRequest, @Body() body: any) {
-    return this.identity.confirmMfaEnrollment(await this.sessions.require(req), body?.code);
+    return this.identity.confirmMfaEnrollment(
+      await this.sessions.require(req, undefined, MFA_SETUP),
+      body?.code,
+    );
   }
   @Get("sessions") async listSessions(@Req() req: FastifyRequest) {
-    const principal = await this.sessions.require(req);
+    const principal = await this.sessions.require(req, undefined, MFA_SETUP);
     return this.identity.sessionsForUser(principal.id);
   }
   @Post("sessions/:id/revoke") async revokeSession(
     @Req() req: FastifyRequest,
     @Param("id") id: string,
   ) {
-    const principal = await this.sessions.require(req);
+    const principal = await this.sessions.require(req, undefined, MFA_SETUP);
     const owned = (await this.identity.sessionsForUser(principal.id)).some(
       (row) => row.id === assertUuid(id, "session"),
     );
@@ -585,6 +607,11 @@ export class PlatformController {
     await this.sessions.require(req, "platform.fleet.read");
     return this.identity.organizations();
   }
+  /** Onboarding starts here: the village must exist before its first administrator is invited. */
+  @Post("organizations") async createOrganization(@Req() req: FastifyRequest, @Body() body: any) {
+    const principal = await this.sessions.require(req, "organization.manage");
+    return this.identity.createOrganization(principal, { name: body?.name });
+  }
   /** Platform access to a customer is never implicit: it needs a reason and an expiry. */
   @Post("organizations/:id/support-access") async supportAccess(
     @Req() req: FastifyRequest,
@@ -610,7 +637,6 @@ export class PlatformController {
 
 @Controller()
 export class DeviceController {
-  private readonly enrollmentAttempts = new Map<string, { startedAt: number; count: number }>();
   constructor(
     @Inject(Store) private readonly store: Store,
     @Inject(Sessions) private readonly sessions: Sessions,
@@ -639,7 +665,6 @@ export class DeviceController {
     @Req() req: FastifyRequest,
     @Body() body: any,
   ) {
-    this.limitEnrollmentAttempts(req.ip);
     if (!validateProtocol("controller-enrollment", body))
       throw new BadRequestException("Invalid controller enrollment request.");
     const result = await this.store.claimController({
@@ -651,22 +676,6 @@ export class DeviceController {
     if (!validateProtocol("controller-enrollment-response", result))
       throw new Error("Controller enrollment response failed protocol validation.");
     return result;
-  }
-  private limitEnrollmentAttempts(ip: string) {
-    const now = Date.now();
-    const current = this.enrollmentAttempts.get(ip);
-    if (current && now - current.startedAt < 60_000) {
-      if (current.count >= 8) throw new HttpException("Too many enrollment attempts.", 429);
-      current.count += 1;
-      return;
-    }
-    if (this.enrollmentAttempts.size >= 2048) {
-      for (const [address, attempt] of this.enrollmentAttempts)
-        if (now - attempt.startedAt >= 60_000) this.enrollmentAttempts.delete(address);
-      if (this.enrollmentAttempts.size >= 2048)
-        throw new HttpException("Too many enrollment attempts.", 429);
-    }
-    this.enrollmentAttempts.set(ip, { startedAt: now, count: 1 });
   }
 }
 

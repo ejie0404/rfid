@@ -1,5 +1,9 @@
 # SmartGate detailed implementation plan
 
+This 26 September snapshot describes the roadmap before the hosted deployment phase. See
+[current implementation status](implementation-status.md) for newer Git, Vercel, and runtime
+evidence.
+
 Updated 26 September 2026. Scope: one supervised resident RFID pilot at one subdivision gate, followed by a decision about expansion. The plan uses two repositories: `smartgate-platform` for the NestJS API, PostgreSQL schema, shared contracts, and the three Next.js apps; `smartgate-edge` for Go, SQLite, local authorization, guard asset serving, and hardware adapters. The platform owns the versioned cloud-to-edge protocol.
 
 ## Current baseline and limits

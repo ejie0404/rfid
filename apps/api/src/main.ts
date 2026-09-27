@@ -1,6 +1,8 @@
 import { createApp } from "./app.js";
+import { loadRuntimeConfig } from "./runtime-config.js";
+const config = loadRuntimeConfig();
 const { app, store } = await createApp({ logger: true });
-await app.listen(Number(process.env.PORT || 4100), "127.0.0.1");
+await app.listen(config.port, config.host);
 let stopping = false;
 let processingDueMoveOuts: Promise<void> | null = null;
 const processDueMoveOuts = () => {
@@ -26,14 +28,17 @@ const processDueMoveOuts = () => {
   processingDueMoveOuts = task;
   return task;
 };
-void processDueMoveOuts();
-const moveOutWorker = setInterval(() => void processDueMoveOuts(), 15_000);
-moveOutWorker.unref();
+let moveOutWorker: NodeJS.Timeout | undefined;
+if (!config.production) {
+  void processDueMoveOuts();
+  moveOutWorker = setInterval(() => void processDueMoveOuts(), 15_000);
+  moveOutWorker.unref();
+}
 for (const signal of ["SIGINT", "SIGTERM"] as const)
   process.on(signal, async () => {
     if (stopping) return;
     stopping = true;
-    clearInterval(moveOutWorker);
+    if (moveOutWorker) clearInterval(moveOutWorker);
     await app.close();
     await processingDueMoveOuts;
     await store.close();

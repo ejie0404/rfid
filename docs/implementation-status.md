@@ -1,6 +1,6 @@
 # SmartGate implementation status
 
-Updated 26 September 2026.
+Updated 27 September 2026.
 
 **Real accounts, organization membership, invitation acceptance, controller identity, scoped sync,
 site/lane setup, and the first usable version of all three applications are implemented. The edge
@@ -8,10 +8,19 @@ still runs simulated hardware; this is not a completed V1 or a commissioned gate
 
 ## Open the running previews
 
+The local URLs below work only while their development servers are running. The three Vercel
+frontend projects were previously published and their sign-in pages were checked on 26 September;
+authenticated use still depends on deploying the API and rebuilding each frontend with its HTTPS
+API URL.
+
 - [Village management](http://127.0.0.1:3000)
 - [Guard web app](http://127.0.0.1:3001)
 - [Resident portal](http://127.0.0.1:3002)
 - [Guard app served by the edge](http://127.0.0.1:4200)
+
+- [Management deployment](https://smartgate-control.vercel.app)
+- [Guard deployment](https://smartgate-guard.vercel.app)
+- [Resident deployment](https://smartgate-resident.vercel.app)
 
 See the platform and edge READMEs for restart commands if these local processes have stopped.
 
@@ -46,7 +55,7 @@ See the platform and edge READMEs for restart commands if these local processes 
 | UI                  | Role-specific sign-in screens, invitation management, responsive layouts, explicit development banner                                                                                                                                                           |
 | Setup dashboard     | Site/lane creation, one-time controller grant, assigned-lane display, status, revocation, and credential rotation in HOA administration                                                                                                                         |
 
-## Validation observed
+## Validation previously observed (26 September 2026)
 
 - Platform suite: **36 tests passed, with one PostgreSQL-only lock regression skipped in PGlite**
   (**37 total**) across access-control, protocol, identity, occupancy, and
@@ -84,7 +93,115 @@ See the platform and edge READMEs for restart commands if these local processes 
   SQLite process restart. This used the demo-only controller identity and simulated hardware. No
   real enrolled HTTPS controller or physical gate was used.
 
+## Initial next-phase implementation snapshot (27 September 2026)
+
+- `npm test`: 49 passed, no failures, and one existing PostgreSQL-only race test skipped.
+- `npm run typecheck`, `npm run build`, `npm run format:check`, and `npm run protocol:check` passed;
+  the protocol manifest contains five schemas.
+- `npm run verify:postgres`: all 19 checks passed against local PostgreSQL 17.11. The verifier
+  applied migrations `001` through `013` with a separate migration role, confirmed the application
+  role cannot change schema, ran PostgreSQL integration tests, dumped and restored representative
+  data, checked migration checksums, and removed its 10 temporary databases and two roles.
+- The modified edge access regression passed with `go test -race ./internal/access`. The full edge
+  race suite could not run its HTTP sync test because the sandbox denied binding the test listener.
+- Docker is not installed here, so the container image has not been built. PostgreSQL verification
+  and an isolated dump/restore rehearsal passed locally; provider deployment and service restart
+  acceptance have not run.
+- The Vercel frontends build locally, but no hosted API URL exists yet. Deployed authentication,
+  responsive role workflows, and enrolled HTTPS controller acceptance remain unverified.
+
+## Hosted API audit fixes (27 September 2026)
+
+- Fixed all four audited source defects: the standalone worker stays referenced between polls; its
+  production entrypoint now passes the PostgreSQL idle window and processes a due move-out; the API
+  readiness probe sends an allowed public Host while connecting locally; API and worker Docker
+  targets have separate launch and health behavior; and relative embedded-data paths resolve from
+  the platform root.
+- A follow-up review corrected four gaps. `.dockerignore` now excludes `.data` and `.env` files at
+  any depth, so the `apps/api` embedded database can no longer enter an image. The README now
+  documents per-target image builds instead of running the worker in the API image. The probe
+  entrypoint always runs its check; it previously skipped the check and exited 0 when started
+  through a symlinked path. A failed lease lock or unlock now destroys that database session.
+- A second review fixed two request-boundary defects. Attempt limits now use the router's matched
+  route; previously a percent-encoded path such as `/auth/log%69n` reached the sign-in or controller
+  enrollment handler after the raw path was limited. Trusted proxies are now compared as parsed
+  addresses, so IPv4-mapped, compressed or expanded, and uppercase IPv6 spellings of a configured
+  proxy are accepted instead of receiving 403. Fastify client-IP attribution uses the same check;
+  it previously also trusted the distinct IPv4-compatible form (`::a.b.c.d`) of a mapped entry,
+  which would have let that peer choose the client IP used for attempt limits.
+- The ignored root `.env` now selects `apps/api/.data/postgres`, the directory the local API used
+  before paths were anchored to the platform root (all 13 migrations, the five demo accounts). The
+  root `.data/postgres` copy stops at migration 007, has no accounts, and fails migration 008 on its
+  legacy vehicle history; it was kept untouched as an archive. No database was moved, merged, reset,
+  or overwritten. On the selected directory, the local development API became ready, all five demo
+  accounts signed in, the HOA snapshot loaded, and the development worker ran and stopped on SIGINT.
+- `npm test`: **62 passed, 0 failed, 1 existing PostgreSQL-only test skipped**. This includes
+  encoded-path sign-in and enrollment limits, equivalent-address proxy matching with untrusted-peer
+  refusal, the subprocess worker-lifetime and cross-working-directory PGlite regressions, and probe
+  processes run
+  against a listening exact-host API on a non-default port: 403 for loopback, unapproved Host, and
+  unapproved Origin requests; failure on database outage, migration mismatch, stopped and
+  unresponsive services, and symlinked invocation. Static tests guard the Dockerfile targets and
+  build-context exclusions.
+- `npm run typecheck`, `npm run build`, `npm run format:check`, `npm run protocol:check`, and
+  `git diff --check` passed. The protocol manifest contains five schemas.
+- `npm run verify:postgres`: **all 20 checks passed** against PostgreSQL 17.11. In addition to
+  migration-role separation, application-role DDL denial, PostgreSQL suites, and dump/restore, two
+  production worker entrypoints survived the real pool idle period, processed one due move-out at
+  its stored cutoff, wrote one occupancy audit record, and stopped on SIGINT and SIGTERM. A
+  restarted worker completed a newly due schedule without duplicating the completed one. The
+  verifier cleaned up all 11 run-owned databases and both run-owned roles.
+- Docker is unavailable in this environment. The API and worker targets are implemented and pass
+  static checks, but image builds and container runtime acceptance have not run. Hosted
+  API/database setup and Vercel-to-API authentication remain unverified.
+
+## Customer onboarding and current local checks (27 September 2026)
+
+- Real mode had no way to create a village. Invitations require an existing organization, and no
+  API route, screen, or command created one, so a hosted operator could not onboard a customer
+  without direct SQL. An operator who signed in to the management app reached a "No access yet"
+  screen.
+- `POST /platform/organizations` now creates a village. It requires `organization.manage`, held
+  only by platform administrators; platform support and support-grant sessions are refused. Names
+  are trimmed, internal spacing is collapsed, and duplicates are refused regardless of case and
+  spacing under a transaction advisory lock. Each creation writes `organization.created` to the new
+  village's audit history.
+- The management app shows platform accounts a **Villages** screen: the village list, an add form,
+  and a per-village administrator invitation with a one-time code, an `?invite=` link, and copy
+  buttons. Platform support sees the list read-only.
+- The shared portal no longer shows demonstration labels to real villages. The breadcrumb, guard
+  heading, resident greeting, and gate card previously read "Palm Grove", "Andrea", and "Main gate ·
+  Hikvision pilot target" for every village; they now use the village's own name, site, and lanes
+  and the user's first name, and say when no gate is set up. A session without a selected village no
+  longer requests the village snapshot every four seconds.
+- Built apps rejected every plain-HTTP API address, a regression from the Slice 1 URL validation:
+  every local static export, including `npm run demo` and the edge-served guard app, showed "This
+  portal is not configured". Plain HTTP is now accepted only for an explicitly configured loopback
+  address. A build with `http://api.example.test` still shows the configuration screen, HTTPS and
+  local loopback exports show sign-in, and a Vercel build with a loopback address fails. The demo
+  command now loads the root `.env`.
+- `npm test`: **65 passed, 0 failed, 2 PostgreSQL-only tests skipped** (67 total), including the new
+  onboarding suite.
+- `npm run verify:postgres`: **all 21 checks passed** against PostgreSQL 17.11. The onboarding suite
+  ran its 4 tests there, including a concurrent duplicate-name check that holds the creation lock so
+  both submissions wait at it. The verifier cleaned up all 12 run-owned databases and both roles.
+- `npm run typecheck`, `npm run build`, `npm run format:check`, `npm run protocol:check`, and
+  `git diff --check` passed.
+- A headless Brave run passed 24 checks at 1280×900 and 390×844 against the production static
+  export and a throwaway real-mode API. It covered operator sign-in to the Villages screen, village
+  creation, the duplicate-name alert, the invitation code and link with clipboard copy and focus
+  handling, a first administrator accepting on desktop and a second on phone, no horizontal
+  overflow, and no unexpected browser errors. The API then held one village with two members. This
+  used embedded PostgreSQL over loopback HTTP, not a hosted HTTPS deployment.
+
 ## Important remaining work
+
+- Each app has a **Security** tab, and the platform console has a panel, for authenticator
+  enrollment and one-time recovery codes. Setup shows a manual key and an `otpauth://` link; there
+  is no QR code yet. It is disabled for shared demo accounts. Production requires MFA for platform
+  and village administrator accounts: until they enroll, the API refuses everything except account
+  routes and the apps show a setup screen. Guards and residents remain optional. Neither the screen
+  nor the enforced policy has had a browser acceptance pass.
 
 - O1.4 still needs a responsive authenticated browser pass for phone width, invitation/role changes,
   vehicle-correction decisions, session/organization switching, and paged-history retention. The
@@ -107,21 +224,28 @@ See the platform and edge READMEs for restart commands if these local processes 
 - Legacy records cannot always identify each past household. Older ended memberships and inactive
   vehicles may share one archive marked for review; ambiguous active vehicles stop migration until
   their ownership periods are reconciled.
-- No password reset by email, no OIDC or SAML, no envelope encryption for TOTP secrets, bearer
-  tokens in memory rather than httpOnly cookies, and no login rate limiting beyond per-account
-  lockout. See [the authentication decision](authentication.md).
+- No password reset by email, no OIDC or SAML, no envelope encryption for TOTP secrets, and bearer
+  tokens in memory rather than httpOnly cookies. Sensitive requests now have bounded per-process
+  IP limits alongside account lockout; multiple API replicas still need shared provider-level rate
+  limits. See [the authentication decision](authentication.md).
 - Company fleet administration, full occupancy and reassignment workflows, named offline guard
   sessions, audited guard assistance, production guard authentication and PWA deployment, visitor
   QR, notifications, signed updates, and physical Hikvision transport and commissioning remain
   open.
-- The prototype still refuses `NODE_ENV=production` and binds loopback only. A real deployment
-  remains a separate, reviewed release.
+- API source now validates production database, migration, demo, host, origin, and proxy settings,
+  and exposes separate liveness and readiness routes. The API and database have not been deployed,
+  so hosted sign-in and lifecycle flows remain unverified.
 
 ## Git and environment
 
 Both repositories are independent local repositories on `main`. The platform foundation is
-committed locally; the edge foundation is committed as `bfd049b`. Neither repository has a remote.
-No push, GitHub repository creation, deployment, or hardware purchase was performed.
+committed as `747f371` and tracks `origin/main` at `https://github.com/ejie0404/rfid.git`. The edge
+foundation is committed as `bfd049b`; that repository currently has no remote. The platform has
+three Vercel frontend projects as listed above. The API and PostgreSQL have not been deployed.
+
+The current platform worktree contains uncommitted environment, container, API-runtime, worker, and
+frontend changes. The edge worktree contains a pre-existing uncommitted access-engine test change;
+keep that change intact while working on the platform phase.
 
 Runtime data, `node_modules`, binaries, and the project-local Go toolchain are ignored by Git.
 

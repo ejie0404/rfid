@@ -1,0 +1,10 @@
+# Patterns here match from the build-context root only; `**/` is required to match at any depth.
+.git
+**/.next
+**/node_modules
+**/dist
+**/.data
+**/coverage
+**/.env
+**/.env.*
+**/*.tsbuildinfo

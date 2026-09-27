@@ -25,11 +25,11 @@ Demonstration sign-in is only offered because the API reports that it is enabled
 seeded account through the real login path, so it cannot reach anything the equivalent real account
 could not.
 
-The API also runs the scheduled move-out processor: it checks once at startup, then every 15 seconds.
-Start it through the normal API command; there is no separate worker command. Due work is rechecked
-inside the database transaction, so multiple API instances and process restarts can safely retry it.
-Failures are logged and retried on a later check. Apply the database migrations before starting the
-API against a real PostgreSQL database.
+In local development, the API runs the scheduled move-out processor for convenience. A hosted
+deployment runs it as a separately supervised process from the `worker` image target, which starts
+`node apps/api/dist/move-out-worker-main.js` directly. The worker obtains a PostgreSQL advisory
+lease before processing due work, so duplicate instances skip a pass safely. API traffic is not
+required for scheduled work.
 
 ### Real accounts
 
@@ -43,11 +43,16 @@ SMARTGATE_OPERATOR_PASSWORD='a-long-passphrase' npm run setup:operator -- \
   --email operator@example.com --name "Operations lead"
 ```
 
-Then start the API without `SMARTGATE_DEMO` and sign in at `/auth/login`. The platform
-administrator onboards a customer by inviting its first HOA administrator, who then invites
-guards and residents from **Staff & access** in the management app. Invited people accept from the
-app at **I have an invitation**, or from a link carrying the code, so nobody needs the API. An
-account that already exists must sign in first.
+Then start the API without `SMARTGATE_DEMO` and sign in to the management app with the operator
+account. Its **Villages** screen adds a customer village and issues the one-time invitation code
+and link for that village's first administrator. Outbound email is not configured, so deliver them
+privately. That administrator invites guards and residents from **Staff & access**. Invited people
+accept from the app at **I have an invitation**, or from a link carrying the code, so nobody needs
+the API. An account that already exists must sign in first.
+
+For production, run the operator command against the external database after applying migrations,
+with `SMARTGATE_DEMO=false` and `SMARTGATE_SKIP_MIGRATIONS=true`. If no password environment value
+is supplied, the command prompts for the password.
 
 Two test villages can be operated at the same time. Organization scope comes from an authenticated
 membership, never from the browser.
@@ -75,8 +80,10 @@ See [the authentication decision](docs/authentication.md) and
 ## Data and local infrastructure
 
 Without `DATABASE_URL`, the API uses **PGlite**, an embedded PostgreSQL runtime, under
-`.data/postgres`, so the prototype runs without Docker. That is a local development option, not a
-deployment, and only one API process may use a given directory.
+`.data/postgres`, so the prototype runs without Docker. Relative `SMARTGATE_DATA_DIR` values are
+resolved from the repository root for every command. That is a local development option, not a
+deployment. Only one process at a time (the API, the worker, or operator setup) may open a given
+directory; the local API already processes scheduled move-outs.
 
 For a real database, separate migration and application roles are required. The application
 verifies the schema instead of changing it.
@@ -111,8 +118,27 @@ npm run verify:postgres   # privilege separation, PostgreSQL suites, and a resto
 ```
 
 Run each development server in a separate terminal. Run `npm run build:packages` first when
-developing portals from a fresh checkout. The production-style preview serves the built static
-exports; rebuild and reload after UI changes.
+developing portals from a fresh checkout. `npm run demo` serves the built static exports; rebuild
+and reload after UI changes. A built app accepts a plain-HTTP API address only on loopback, such as
+`http://127.0.0.1:4100`. Any other address must use HTTPS, and Vercel builds require a public HTTPS
+API address.
+
+## Hosted deployment
+
+Set the backend environment described in [environment configuration](docs/environment.md). The API
+requires external PostgreSQL, demo mode disabled, a verified schema, and exact host and origin
+allowlists. Build one image per role from the repository root:
+
+```sh
+docker build -f infrastructure/Dockerfile --target api -t smartgate-api .
+docker build -f infrastructure/Dockerfile --target worker -t smartgate-move-out-worker .
+```
+
+Run them as separate supervised services against the same data-only application role. The worker
+image has no HTTP listener or HTTP healthcheck. Do not run the worker command in the API image,
+because it would inherit the API readiness check. Apply schema changes with the separate migration
+role before routing traffic; `/health/ready` checks that the required schema is available. The
+environment guide lists the migration and service run commands.
 
 ## Repository boundary
 
@@ -130,7 +156,9 @@ and [Hikvision commissioning requirements](docs/hikvision-pilot.md).
 
 ## Deployment boundary
 
-This code intentionally refuses `NODE_ENV=production` and binds only to loopback. Real device
-enrollment, TLS, MQTT, local guard authentication, and physical commissioning must replace the
-demonstration boundaries before a live pilot. All physical actuation is disabled in the current
+Production API startup validates external PostgreSQL, migration state, demo mode, allowed origins,
+and request hosts before binding to the configured interface. This repository change does not
+provision a provider or deploy the API. The edge still uses simulated hardware; real device
+enrollment, local guard authentication, confirmed controller behavior, and supervised physical
+commissioning remain separate acceptance gates. Physical actuation is disabled in the current
 executable.
