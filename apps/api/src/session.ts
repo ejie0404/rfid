@@ -30,10 +30,22 @@ export interface DeviceIdentity {
 export interface DeviceAuthenticator {
   authenticateController(credential: string): Promise<DeviceIdentity>;
 }
+export interface RequireOptions {
+  /**
+   * Account routes a privileged person needs in order to finish MFA enrollment (their session,
+   * enrollment, scope, password, and session list). Every other route enforces the MFA policy.
+   */
+  allowDuringMfaSetup?: boolean;
+}
 export class Sessions {
   constructor(private readonly identity: Identity) {}
-  async require(req: FastifyRequest, permission?: Permission): Promise<Principal> {
+  async require(
+    req: FastifyRequest,
+    permission?: Permission,
+    options: RequireOptions = {},
+  ): Promise<Principal> {
     const principal = await this.identity.resolve(bearer(req));
+    if (!options.allowDuringMfaSetup) this.identity.assertMfaPolicy(principal);
     if (permission && !canAct(principal, permission)) throw new ForbiddenException();
     return principal;
   }

@@ -29,6 +29,8 @@ export interface Session {
   memberships: MembershipSummary[];
   platform_role?: string;
   mfa_enabled: boolean;
+  /** A privileged account must finish MFA enrollment before this session can do anything else. */
+  mfa_setup_required?: boolean;
 }
 /** The demonstration sign-in is offered only when the API reports that it is enabled. */
 const demoProfiles: Record<Mode, { profile: string; label: string }[]> = {
@@ -55,6 +57,7 @@ export function useSession(api: string) {
     if (invite) setPendingInvitation(invite);
   }, []);
   useEffect(() => {
+    if (!api) return;
     let active = true;
     fetch(api + "/setup/status", { signal: AbortSignal.timeout(3000) })
       .then((response) => (response.ok ? response.json() : null))
@@ -240,6 +243,18 @@ export function useSession(api: string) {
     setChallenge("");
     setError(message ?? "Your session has ended. Sign in again.");
   }, []);
+  /** Records that this account now requires MFA; the current session already satisfied it. */
+  const markMfaEnabled = useCallback(() => {
+    setSession((current) => (current ? { ...current, mfa_enabled: true } : current));
+  }, []);
+  /** Called when the API reports that this session is limited to MFA enrollment. */
+  const requireMfaSetup = useCallback(() => {
+    setSession((current) => (current ? { ...current, mfa_setup_required: true } : current));
+  }, []);
+  /** Leaves the required-setup screen once the recovery codes have been saved. */
+  const completeMfaSetup = useCallback(() => {
+    setSession((current) => (current ? { ...current, mfa_setup_required: false } : current));
+  }, []);
   return {
     session,
     token,
@@ -262,6 +277,9 @@ export function useSession(api: string) {
     selectOrganization,
     logout,
     onUnauthorized,
+    markMfaEnabled,
+    requireMfaSetup,
+    completeMfaSetup,
   };
 }
 export type Auth = ReturnType<typeof useSession>;

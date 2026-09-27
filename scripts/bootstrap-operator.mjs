@@ -29,15 +29,25 @@ The account is refused if a platform administrator already exists.`);
 }
 const email = args.get("email");
 const name = args.get("name") || "Platform administrator";
+if (process.env.NODE_ENV === "production") {
+  if (!process.env.DATABASE_URL) {
+    console.error("DATABASE_URL is required to bootstrap an operator in production.");
+    process.exit(1);
+  }
+  if (process.env.SMARTGATE_DEMO !== "false") {
+    console.error("Set SMARTGATE_DEMO=false before bootstrapping a production operator.");
+    process.exit(1);
+  }
+  if (process.env.SMARTGATE_SKIP_MIGRATIONS !== "true") {
+    console.error("Set SMARTGATE_SKIP_MIGRATIONS=true after applying migrations separately.");
+    process.exit(1);
+  }
+}
 let password = args.get("password") || process.env.SMARTGATE_OPERATOR_PASSWORD || "";
 if (!password) {
   const prompt = createInterface({ input: process.stdin, output: process.stdout });
   password = await prompt.question("Operator password (minimum 12 characters): ");
   prompt.close();
-}
-if (process.env.NODE_ENV === "production") {
-  console.error("Refusing to run account bootstrap in production mode.");
-  process.exit(1);
 }
 const store = new Store();
 try {
@@ -50,7 +60,9 @@ try {
   } else {
     const created = await identity.createOperator({ email, name, password });
     console.log("Created platform administrator " + created.email + " (" + created.user_id + ")");
-    console.log("Sign in with POST /auth/login. Enrol MFA with POST /auth/mfa/enroll.");
+    console.log(
+      "Sign in to the management app; production requires two-step verification setup first.",
+    );
   }
 } catch (error) {
   console.error(error instanceof Error ? error.message : error);

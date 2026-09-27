@@ -106,6 +106,13 @@ export function canAct(principal: Principal, permission: Permission): boolean {
 export function isPlatformRole(role: Role): boolean {
   return role === "platform_admin" || role === "platform_support";
 }
+/**
+ * Roles that can change another person's access or reach more than one household. When the
+ * privileged-account MFA policy is on, these roles must enroll an authenticator before acting.
+ */
+export function isPrivilegedRole(role: Role): boolean {
+  return isPlatformRole(role) || role === "hoa_admin";
+}
 export function isMembershipRole(role: Role): role is MembershipRole {
   return role === "hoa_admin" || role === "guard" || role === "resident";
 }

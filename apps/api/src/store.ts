@@ -1,8 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import { mkdirSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { resolve } from "node:path";
 import { IDS, type Configuration, type AccessEvent } from "@smartgate/contracts";
 import type { Principal } from "@smartgate/permissions";
 import {
@@ -18,6 +17,7 @@ import {
   type SqlSession,
 } from "./migrations.js";
 import { hashPassword } from "./crypto.js";
+import { resolveDataDirectory } from "./data-directory.js";
 import type { DeviceIdentity } from "./session.js";
 
 const migrations = new URL("../../../database/migrations/", import.meta.url);
@@ -69,6 +69,7 @@ type ControllerGrantInput = {
 export class Store {
   private memory?: PGlite;
   private pool?: Pool;
+  private localMoveOutWorkerLease = false;
   private queue: Promise<unknown> = Promise.resolve();
   private demo = false;
   query!: Query;
@@ -78,7 +79,7 @@ export class Store {
       this.pool = new Pool({ connectionString: process.env.DATABASE_URL, max: 5 });
       this.query = async (s, v) => this.pool!.query(s, v);
     } else {
-      const directory = resolve(process.env.SMARTGATE_DATA_DIR || ".data/postgres");
+      const directory = resolveDataDirectory();
       if (!options.test) mkdirSync(directory, { recursive: true });
       this.memory = new PGlite(options.test ? undefined : directory);
       this.query = (s, v) => this.memory!.query(s, v);
@@ -102,23 +103,37 @@ export class Store {
         "This database has no applied migrations. Run `npm run migrate` with migration credentials before starting the application.",
       );
     const recorded = (
-      await this.query("SELECT version FROM schema_migrations ORDER BY version")
-    ).rows.map((row) => row.version as string);
-    const expected = migrationFiles(migrations).map((file) => file.version);
-    const missing = expected.filter((version) => !recorded.includes(version));
+      await this.query("SELECT version,checksum FROM schema_migrations ORDER BY version")
+    ).rows as Array<{ version: string; checksum: string }>;
+    const expected = migrationFiles(migrations);
+    const presentVersions = new Set(recorded.map((row) => row.version));
+    const missing = expected.filter((file) => !presentVersions.has(file.version));
     if (missing.length)
       throw new Error(
         "This database is missing required migrations: " +
-          missing.join(", ") +
+          missing.map((file) => file.version).join(", ") +
           ". Run `npm run migrate` with migration credentials before starting the application.",
       );
-    const unknown = recorded.filter((version) => !expected.includes(version));
+    const expectedByVersion = new Map(expected.map((file) => [file.version, file.checksum]));
+    const unknown = recorded.filter((row) => !expectedByVersion.has(row.version));
     if (unknown.length)
       throw new Error(
         "This database has migrations this build does not know about: " +
-          unknown.join(", ") +
+          unknown.map((row) => row.version).join(", ") +
           ". Deploy the matching application version.",
       );
+    const changed = recorded.filter((row) => expectedByVersion.get(row.version) !== row.checksum);
+    if (changed.length)
+      throw new Error(
+        "Applied migration checksums do not match this build: " +
+          changed.map((row) => row.version).join(", ") +
+          ". Restore the matching application version or add a forward migration.",
+      );
+  }
+  /** Confirms that the database is reachable and matches every migration in this build. */
+  async checkReady() {
+    await this.query("SELECT 1");
+    await this.assertMigrated();
   }
   async exec(sql: string) {
     if (this.memory) await this.memory.exec(sql);
@@ -173,6 +188,56 @@ export class Store {
     await this.queue;
     await this.memory?.close();
     await this.pool?.end();
+  }
+  /**
+   * Acquire the process-wide scheduled move-out lease for one processing pass. PostgreSQL keeps
+   * this session advisory lock until the returned release callback runs or the connection closes,
+   * so a second worker instance skips the same pass instead of incrementing retries concurrently.
+   * Production configuration requires PostgreSQL; the local lease only coordinates workers
+   * sharing this in-memory Store instance.
+   */
+  async acquireScheduledMoveOutWorkerLease(): Promise<(() => Promise<void>) | null> {
+    if (!this.pool) {
+      if (this.localMoveOutWorkerLease) return null;
+      this.localMoveOutWorkerLease = true;
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        this.localMoveOutWorkerLease = false;
+      };
+    }
+
+    const client: PoolClient = await this.pool.connect();
+    try {
+      const result = await client.query<{ acquired: boolean }>(
+        "SELECT pg_try_advisory_lock($1, $2) AS acquired",
+        [0x5347, 0x4d4f],
+      );
+      if (!result.rows[0]?.acquired) {
+        client.release();
+        return null;
+      }
+
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        try {
+          await client.query("SELECT pg_advisory_unlock($1, $2)", [0x5347, 0x4d4f]);
+        } catch (error) {
+          // The session may still hold the lease. Destroying the connection ends that session, so
+          // it cannot return to the pool and block later passes until the idle timeout.
+          client.release(true);
+          throw error;
+        }
+        client.release();
+      };
+    } catch (error) {
+      // The lock state is unknown after a failed attempt, so discard the session with it.
+      client.release(true);
+      throw error;
+    }
   }
   /**
    * Process due schedules from durable database state. Each move-out re-locks the property,

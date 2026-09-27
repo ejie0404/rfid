@@ -34,6 +34,14 @@ verification, and when MFA is enabled every other session of that account is rev
 Relatedly, `platform.fleet.read` is a platform-only permission, so a customer administrator holding
 `organization.read` for its own village cannot enumerate other customers.
 
+**Privileged accounts must enroll MFA before acting.** When the policy is on, a session acting as
+a platform administrator, platform support, or village administrator that has not passed MFA is
+limited to its own account routes (session, scope, password, session list, and MFA enrollment).
+Every other route returns 403 with code `MFA_SETUP_REQUIRED`, and the apps show a setup screen.
+Guards and residents are not required to enroll. The policy is always on in production,
+`SMARTGATE_REQUIRE_PRIVILEGED_MFA=false` is refused there, and demonstration mode never enforces it
+because its accounts are shared.
+
 **An existing account must authenticate before it can be claimed.** An account that already exists
 can never be entered from an invitation token alone, whether or not it currently holds access: a
 forwarded or leaked token would otherwise issue a session as that person without their password. An
@@ -77,6 +85,8 @@ A platform administrator does **not** receive household data implicitly. Reading
 ## Demonstration mode is separated
 
 `SMARTGATE_DEMO=true` seeds the fictional village and enables `POST /demo/session`. Without it the process runs in **real mode**: the demo endpoint does not exist, no fictional data is seeded, and the first account is created by an operator either through `POST /setup/operator` (requiring a one-time token from `SMARTGATE_SETUP_TOKEN`, and only while no platform administrator exists) or through `npm run setup:operator`.
+
+The operator then creates each customer village from the management app (`POST /platform/organizations`) and invites its first HOA administrator. Creating a village needs `organization.manage`, which only the platform administrator role holds; platform support and support-grant sessions are refused. Each creation is recorded as `organization.created` in the new village's audit history.
 
 `NODE_ENV=production` refuses demonstration mode outright.
 

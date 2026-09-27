@@ -1,3 +1,7 @@
+import { validateSmartGateVercelBuild } from "../../packages/ui/next-config.mjs";
+
+validateSmartGateVercelBuild("resident");
+
 export default {
   output: "export",
   transpilePackages: ["@smartgate/ui"],

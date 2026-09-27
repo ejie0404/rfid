@@ -475,14 +475,6 @@ h1 {
 .tree-two:after {
   left: 20px;
 }
-.illustration-label {
-  position: absolute;
-  bottom: 1px;
-  right: 85px;
-  font-size: 9px;
-  letter-spacing: 4px;
-  color: #b6c7a9;
-}
 .road-line {
   position: absolute;
   width: 300px;
@@ -1147,9 +1139,6 @@ label select {
   .tree-one {
     right: -30px;
   }
-  .illustration-label {
-    right: 37px;
-  }
   .two-columns {
     grid-template-columns: 1fr 1fr;
   }
@@ -1572,4 +1561,301 @@ label select {
 }
 .lane-option input {
   accent-color: var(--green);
+}
+
+/* Platform operator console: customer villages and first-administrator invitations. */
+.platform-shell {
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 12% 18%, #eaf7ec 0%, transparent 42%),
+    radial-gradient(circle at 88% 8%, #f2fbe4 0%, transparent 38%), var(--bg);
+}
+.platform-page {
+  width: min(960px, 100%);
+  margin: 0 auto;
+  padding: 28px 24px 48px;
+}
+.platform-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 30px;
+}
+.platform-account {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px 16px;
+  text-align: right;
+}
+.platform-account strong,
+.platform-account small {
+  display: block;
+}
+.platform-account strong {
+  font-size: 13px;
+}
+.platform-account small {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.platform-main {
+  display: grid;
+  gap: 18px;
+}
+.platform-main .subtitle {
+  max-width: 640px;
+  font-size: 13px;
+}
+.platform-main .notice {
+  margin-bottom: 0;
+}
+.platform-live:empty {
+  display: none;
+}
+.platform-main .panel h2 {
+  font-size: 14px;
+  font-weight: 750;
+  letter-spacing: -0.1px;
+}
+.platform-main .panel-heading p {
+  font-size: 11px;
+}
+.platform-main h2[tabindex="-1"]:focus {
+  outline: none;
+}
+.village-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+  padding: 0 22px 22px;
+}
+.village-form label {
+  flex: 1 1 260px;
+}
+.village-form label input {
+  font-size: 13px;
+}
+.village-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.village-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+  padding: 16px 22px;
+  border-top: 1px solid var(--border);
+}
+.village-row-main {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  margin-right: auto;
+}
+.village-row-main strong {
+  color: #344e3e;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.village-row-main small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.village-list-notice {
+  margin: 0 22px 18px;
+}
+.invite-values {
+  margin: 0;
+}
+.invite-values dt {
+  margin: 0 24px 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.invite-values dd {
+  margin: 0 24px 16px;
+}
+.invite-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 0 24px 22px;
+}
+@media (max-width: 560px) {
+  .platform-page {
+    padding: 18px 14px 36px;
+  }
+  .platform-header {
+    margin-bottom: 22px;
+  }
+  .platform-account {
+    width: 100%;
+    justify-content: space-between;
+    text-align: left;
+  }
+  .village-form,
+  .invite-actions {
+    padding: 0 16px 18px;
+  }
+  .village-row {
+    padding: 15px 16px;
+  }
+  .village-form .button,
+  .village-row .button,
+  .invite-actions .button {
+    width: 100%;
+  }
+  .invite-values dt,
+  .invite-values dd {
+    margin-left: 16px;
+    margin-right: 16px;
+  }
+  .village-list-notice {
+    margin: 0 16px 16px;
+  }
+}
+
+/* Village names come from customer records, so a long name stays inside the breadcrumb. */
+.breadcrumb {
+  min-width: 0;
+}
+.breadcrumb span {
+  max-width: min(320px, 40vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Account security: authenticator enrollment and one-time recovery codes. */
+.security-panel {
+  max-width: 720px;
+}
+.security-panel h2[tabindex="-1"]:focus {
+  outline: none;
+}
+.security-body {
+  display: grid;
+  gap: 16px;
+  padding: 0 22px 22px;
+  font-size: 12px;
+  line-height: 1.7;
+  color: #52635a;
+}
+.security-body .notice {
+  margin-bottom: 0;
+}
+.security-live:empty {
+  display: none;
+}
+.security-steps {
+  margin: 0;
+  padding-left: 20px;
+  display: grid;
+  gap: 6px;
+}
+.security-key {
+  margin: 0;
+}
+.security-key dt {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.security-key dd {
+  margin: 0;
+}
+.security-secret {
+  display: block;
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  word-break: break-all;
+  background: #eef3ef;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.security-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.security-actions a.button {
+  text-decoration: none;
+  color: inherit;
+}
+.security-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 12px;
+}
+.security-form label {
+  flex: 0 1 220px;
+}
+.security-form input {
+  font-size: 16px;
+  letter-spacing: 0.2em;
+}
+.recovery-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 0;
+  padding: 14px;
+  list-style: none;
+  background: #eef3ef;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.recovery-codes li {
+  font-size: 13px;
+  letter-spacing: 0.05em;
+}
+.security-check {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+}
+.security-check input {
+  width: auto;
+  accent-color: var(--green);
+}
+@media (max-width: 560px) {
+  .security-body {
+    padding: 0 16px 18px;
+  }
+  .security-actions .button,
+  .security-form .button,
+  .security-form label {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+}
+.mfa-gate {
+  width: min(720px, 100%);
+  display: grid;
+  gap: 18px;
+}
+.mfa-gate .platform-header {
+  margin-bottom: 4px;
+}
+.mfa-gate .notice {
+  margin-bottom: 0;
+  justify-content: flex-start;
 }

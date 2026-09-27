@@ -13,6 +13,7 @@ import type {
   Principal,
   Role,
 } from "@smartgate/permissions";
+import { isPrivilegedRole } from "@smartgate/permissions";
 import {
   hashPassword,
   newRecoveryCodes,
@@ -47,8 +48,14 @@ export interface IssuedSession {
   principal: Principal;
   memberships: MembershipSummary[];
   mfa_enabled: boolean;
+  /** The session may only complete MFA enrollment until this account has enrolled. */
+  mfa_setup_required: boolean;
   platform_role?: string;
 }
+export interface IdentityOptions {
+  requirePrivilegedMfa?: boolean;
+}
+export const MFA_SETUP_REQUIRED = "MFA_SETUP_REQUIRED";
 export function assertPassword(password: unknown): string {
   if (typeof password !== "string" || password.length < MINIMUM_PASSWORD)
     throw new BadRequestException(`Password must be at least ${MINIMUM_PASSWORD} characters.`);
@@ -75,7 +82,29 @@ export function assertRelationship(value: unknown): HouseholdRelationship {
  * Every tenant decision comes from a membership row, never from caller-supplied input.
  */
 export class Identity {
-  constructor(private readonly store: Store) {}
+  private readonly requirePrivilegedMfa: boolean;
+  constructor(
+    private readonly store: Store,
+    options: IdentityOptions = {},
+  ) {
+    this.requirePrivilegedMfa = options.requirePrivilegedMfa === true;
+  }
+  /**
+   * Whether this session is limited to MFA enrollment. An account that has already enrolled can
+   * only hold verified sessions (see `resolve`), so this applies to privileged roles that have not
+   * enrolled yet. The acting role decides, so a resident-scoped session of the same person is not
+   * limited.
+   */
+  mfaSetupRequired(principal: Pick<Principal, "role" | "mfaSatisfied">) {
+    return this.requirePrivilegedMfa && isPrivilegedRole(principal.role) && !principal.mfaSatisfied;
+  }
+  assertMfaPolicy(principal: Principal) {
+    if (this.mfaSetupRequired(principal))
+      throw new ForbiddenException({
+        message: "Set up two-step verification before using this account.",
+        code: MFA_SETUP_REQUIRED,
+      });
+  }
   private now() {
     return new Date();
   }
@@ -274,7 +303,9 @@ export class Identity {
       mfa_enabled: !!(
         await this.store.query("SELECT mfa_confirmed_at FROM users WHERE id=$1", [userId])
       ).rows[0]?.mfa_confirmed_at,
+      mfa_setup_required: false,
     };
+    issued.mfa_setup_required = this.mfaSetupRequired(issued.principal);
     // A platform session is reported explicitly so the client can tell it apart from a
     // membership-scoped one instead of guessing from the role name.
     if (user.platform_role) issued.platform_role = user.platform_role;
@@ -1250,6 +1281,37 @@ export class Identity {
       });
     });
     return { ok: true };
+  }
+  /**
+   * Creates a customer village, the step before inviting its first HOA administrator. Only a
+   * platform administrator holds `organization.manage`, and a support session stays read-only.
+   * The name check runs under a transaction-scoped advisory lock, so a repeated or concurrent
+   * submission cannot create the same village twice, even across API instances.
+   */
+  async createOrganization(principal: Principal, input: { name: unknown }) {
+    if (principal.supportGrantId)
+      throw new ForbiddenException("Support access is read-only and cannot create villages.");
+    const name = assertText(input.name, "village name").replace(/\s+/g, " ");
+    const id = randomUUID();
+    await this.store.transaction(async (q) => {
+      await q("SELECT pg_advisory_xact_lock($1, $2)", [0x5347, 0x4f52]);
+      const duplicate = (
+        await q(
+          "SELECT 1 FROM organizations WHERE lower(regexp_replace(btrim(name), '\\s+', ' ', 'g'))=lower($1) LIMIT 1",
+          [name],
+        )
+      ).rows.length;
+      if (duplicate) throw new ConflictException("A village with this name already exists.");
+      await q("INSERT INTO organizations(id,name) VALUES($1,$2)", [id, name]);
+      await this.audit(q, {
+        organizationId: id,
+        actorId: principal.id,
+        action: "organization.created",
+        entityId: id,
+        detail: { name },
+      });
+    });
+    return { id, name, config_version: 1, members: 0, properties: 0 };
   }
   async organizations() {
     return (

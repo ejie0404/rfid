@@ -12,6 +12,7 @@ import {
   CircleHelp,
   DoorOpen,
   Home,
+  KeyRound,
   LayoutDashboard,
   LogOut,
   Plus,
@@ -32,6 +33,8 @@ import {
   useSession,
   type Mode,
 } from "./auth";
+import { PlatformConsole } from "./platform";
+import { MFA_SETUP_REQUIRED, MfaSetupRequiredScreen, SecurityPanel } from "./security";
 
 type Vehicle = {
   id: string;
@@ -241,8 +244,67 @@ type Local = {
   authorization_available?: boolean;
   events: Event[];
 };
-const API = "http://127.0.0.1:4100";
-const EDGE = "http://127.0.0.1:4200";
+function isLoopbackHostname(hostname: string) {
+  const value = hostname.toLowerCase();
+  return (
+    value === "[::1]" ||
+    value.startsWith("127.") ||
+    value === "localhost" ||
+    value.endsWith(".localhost") ||
+    value === "localhost."
+  );
+}
+/**
+ * A built app never falls back to a default address; a missing value is a configuration error.
+ * Plain HTTP is accepted for an explicitly configured loopback address, which only reaches the
+ * machine running the browser: local previews and the edge-served guard station. Every other
+ * address needs HTTPS. Vercel builds are also refused at build time unless the API is public HTTPS.
+ */
+function publicBaseUrl(value: string | undefined, name: string, allowHttp: boolean) {
+  if (!value?.trim()) return { url: null, error: null };
+  try {
+    const parsed = new URL(value.trim());
+    const httpAllowed = allowHttp || isLoopbackHostname(parsed.hostname);
+    if (
+      (parsed.protocol !== "https:" && !(httpAllowed && parsed.protocol === "http:")) ||
+      parsed.username ||
+      parsed.password ||
+      parsed.search ||
+      parsed.hash
+    )
+      throw new Error("invalid URL");
+    return { url: parsed.toString().replace(/\/+$/, ""), error: null };
+  } catch {
+    return {
+      url: null,
+      error: allowHttp
+        ? `${name} must be an absolute HTTP or HTTPS base URL without credentials, query, or fragment.`
+        : `${name} must be an absolute HTTPS base URL without credentials, query, or fragment. Plain HTTP is accepted only for a loopback address.`,
+    };
+  }
+}
+
+const development = process.env.NODE_ENV === "development";
+const apiEnvironmentValue = process.env.NEXT_PUBLIC_SMARTGATE_API_URL?.trim();
+const configuredApi = publicBaseUrl(
+  apiEnvironmentValue,
+  "NEXT_PUBLIC_SMARTGATE_API_URL",
+  development,
+);
+const API =
+  configuredApi.url ?? (!apiEnvironmentValue && development ? "http://127.0.0.1:4100" : "");
+const API_CONFIGURATION_ERROR = API
+  ? null
+  : (configuredApi.error ??
+    "Set NEXT_PUBLIC_SMARTGATE_API_URL to the HTTPS base URL of the hosted SmartGate API, then rebuild and redeploy this app.");
+
+const edgeEnvironmentValue = process.env.NEXT_PUBLIC_SMARTGATE_EDGE_URL?.trim();
+const configuredEdge = publicBaseUrl(edgeEnvironmentValue, "NEXT_PUBLIC_SMARTGATE_EDGE_URL", true);
+const EDGE =
+  configuredEdge.url ?? (!edgeEnvironmentValue && development ? "http://127.0.0.1:4200" : null);
+const EDGE_CONFIGURATION_ERROR = configuredEdge.error;
+const simulatorFlag = process.env.NEXT_PUBLIC_SMARTGATE_SIMULATOR_ENABLED;
+const SIMULATOR_ENABLED = simulatorFlag === "true" || (development && simulatorFlag !== "false");
 const formatTime = (value: string) =>
   new Date(value).toLocaleTimeString("en-PH", { hour: "2-digit", minute: "2-digit" });
 const formatWhen = (value: string | null | undefined) =>
@@ -331,6 +393,11 @@ function mergeRowsById<T extends { id: string }>(preferred: T[], fallback: T[]) 
 
 export function Portal({ mode }: { mode: Mode }) {
   const auth = useSession(API);
+  if (API_CONFIGURATION_ERROR)
+    return <ApiConfigurationRequired message={API_CONFIGURATION_ERROR} />;
+  // A privileged account without MFA can only enroll, so the workspace (and its polling) waits.
+  if (auth.session?.mfa_setup_required && !auth.pendingInvitation)
+    return <MfaSetupRequiredScreen api={API} auth={auth} />;
   const principal = auth.session?.principal;
   const sessionScope = principal
     ? [
@@ -345,17 +412,36 @@ export function Portal({ mode }: { mode: Mode }) {
   return <PortalWorkspace key={`${mode}:${sessionScope}`} mode={mode} auth={auth} />;
 }
 
+function ApiConfigurationRequired({ message }: { message: string }) {
+  return (
+    <div className="login-shell">
+      <section className="login-card" aria-labelledby="api-configuration-title">
+        <Logo />
+        <p className="eyebrow">SETUP REQUIRED</p>
+        <h1 id="api-configuration-title">This portal is not configured.</h1>
+        <div className="notice warning" role="alert">
+          {message}
+        </div>
+        <p className="subtitle">
+          Public API settings are embedded when this app is built. After setting the variable,
+          create a new deployment so login, invitations, MFA, and portal data all use the same API.
+        </p>
+      </section>
+    </div>
+  );
+}
+
 function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof useSession> }) {
   const isGuard = mode === "guard",
     isResident = mode === "resident";
-  const { session, token, onUnauthorized, logout, demoEnabled } = auth;
+  const { session, token, onUnauthorized, requireMfaSetup, logout, demoEnabled } = auth;
   const canManageDevices =
     session?.principal.role === "hoa_admin" || session?.principal.role === "platform_admin";
   const canManageCredentials = session?.principal.role === "hoa_admin";
   const nav = isGuard
-    ? ["Gate station", "Access activity", "Help"]
+    ? ["Gate station", "Access activity", "Security", "Help"]
     : isResident
-      ? ["My home", "My vehicles", "My activity", "Help"]
+      ? ["My home", "My vehicles", "My activity", "Security", "Help"]
       : [
           "Overview",
           "Residents",
@@ -363,10 +449,14 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
           "Staff & access",
           "Access activity",
           "Gates & devices",
+          "Security",
         ];
   const [tab, setTab] = useState(nav[0]!);
   const [data, setData] = useState<Snapshot | null>(null);
   const [local, setLocal] = useState<Local | null>(null);
+  const [cloudAvailable, setCloudAvailable] = useState<boolean | null>(null);
+  const [localAvailable, setLocalAvailable] = useState<boolean | null>(null);
+  const [localError, setLocalError] = useState("");
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [search, setSearch] = useState("");
@@ -453,6 +543,10 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
         if (active.current && token.current === requestToken) onUnauthorized();
         throw new Error("Your session has ended. Sign in again.");
       }
+      if (response.status === 403 && payload.code === MFA_SETUP_REQUIRED) {
+        if (active.current && token.current === requestToken) requireMfaSetup();
+        throw new Error("Set up two-step verification before using this account.");
+      }
       if (!response.ok)
         throw new Error(
           typeof payload.message === "string"
@@ -499,7 +593,7 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
       }
       return payload;
     },
-    [onUnauthorized, session?.token, token],
+    [onUnauthorized, requireMfaSetup, session?.token, token],
   );
   useEffect(() => {
     if (priorOrganizationKey.current === organizationKey) return;
@@ -515,7 +609,7 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
     loading.current = true;
     try {
       const work: Promise<any>[] = [request("/snapshot")];
-      if (isGuard)
+      if (isGuard && EDGE)
         work.push(
           fetch(EDGE + "/local/status", { signal: AbortSignal.timeout(2500) }).then((r) => {
             if (!r.ok) throw new Error("Station unavailable");
@@ -526,6 +620,7 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
       if (!active.current) return;
       const cloud = responses[0]!;
       if (cloud.status === "fulfilled") {
+        setCloudAvailable(true);
         setData((current) => {
           if (!current) return cloud.value;
           return {
@@ -550,15 +645,36 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
           };
         });
         setError("");
-      } else
+      } else {
+        setCloudAvailable(false);
         setError(
           isGuard
             ? "Cloud connection unavailable. Local station status is shown below."
             : "The management service is unavailable. Your gate controller operates independently.",
         );
+      }
       if (isGuard) {
-        const edge = responses[1]!;
-        setLocal(edge.status === "fulfilled" ? edge.value : null);
+        if (!EDGE) {
+          setLocal(null);
+          setLocalAvailable(false);
+          setLocalError(
+            EDGE_CONFIGURATION_ERROR ??
+              "Local station status is not configured for this deployment. Set NEXT_PUBLIC_SMARTGATE_EDGE_URL on a guard station build to connect its on-device service.",
+          );
+        } else {
+          const edge = responses[1]!;
+          if (edge.status === "fulfilled") {
+            setLocal(edge.value);
+            setLocalAvailable(true);
+            setLocalError("");
+          } else {
+            setLocal(null);
+            setLocalAvailable(false);
+            setLocalError(
+              "The local station service could not be reached. The cloud dashboard remains available; check the station service and its browser access settings.",
+            );
+          }
+        }
       }
     } finally {
       loading.current = false;
@@ -615,7 +731,9 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
     }
   }, [canManageDevices, request]);
   useEffect(() => {
-    if (!session) return;
+    // A session without a village (the operator console or village chooser) has no workspace to
+    // poll; requesting the snapshot there only produces a 403 every few seconds.
+    if (!session?.principal.organizationId) return;
     active.current = true;
     void load();
     const id = setInterval(() => void load(), 4000);
@@ -673,6 +791,8 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
     .join(", ");
   const events = (isGuard ? (local?.events ?? data?.events) : data?.events) ?? [];
   const heartbeat = data?.heartbeats[0];
+  const heartbeatIsFresh =
+    !!heartbeat?.received_at && Date.now() - new Date(heartbeat.received_at).getTime() < 20000;
   const activeController = controllers
     .filter((controller) => controller.status === "active")
     .sort(
@@ -1209,6 +1329,10 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
   }
   async function scan(event: FormEvent) {
     event.preventDefault();
+    if (!SIMULATOR_ENABLED || !EDGE) {
+      setNotice("Simulator controls are disabled for this deployment.");
+      return;
+    }
     setBusy(true);
     try {
       const response = await fetch(EDGE + "/simulator/scan", {
@@ -1289,6 +1413,8 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
       <Radio size={18} />
     ) : name === "Help" ? (
       <CircleHelp size={18} />
+    ) : name === "Security" ? (
+      <KeyRound size={18} />
     ) : isResident ? (
       <Home size={18} />
     ) : (
@@ -1298,10 +1424,23 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
   const showEvents = ["Access activity", "My activity"].includes(tab);
   if (!session) return <LoginScreen mode={mode} auth={auth} />;
   if (auth.pendingInvitation) return <PendingInvitationScreen mode={mode} auth={auth} />;
+  // A platform account outside any village onboards customers from the management app.
+  if (!session.principal.organizationId && mode === "control" && session.platform_role)
+    return <PlatformConsole api={API} auth={auth} session={session} />;
   if (!session.principal.organizationId) return <OrganizationChooser mode={mode} auth={auth} />;
   const me = session.principal;
   const assignedSite =
     data?.sites.find((site) => me.sites.includes(site.id)) ?? data?.sites[0] ?? null;
+  // Every label comes from the signed-in village's own records, never from demonstration data.
+  const organizationName =
+    data?.organization.name ??
+    session.memberships.find((membership) => membership.organizationId === me.organizationId)
+      ?.organizationName ??
+    "Your village";
+  const firstName = me.name.trim().split(/\s+/)[0] ?? "";
+  const gateLanes = assignedSite
+    ? (data?.lanes ?? []).filter((lane) => lane.site_id === assignedSite.id)
+    : [];
   const roleLabel = me.supportGrantId
     ? "Support access · read only"
     : me.role === "resident"
@@ -1384,35 +1523,46 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
       <main className="main">
         <header className="topbar">
           <div className="breadcrumb">
-            <span>Palm Grove</span>
+            <span title={organizationName}>{organizationName}</span>
             <ChevronRight size={13} />
             <strong>{tab}</strong>
           </div>
           <div className="top-actions">
-            <Badge
-              tone={
-                isResident
-                  ? "neutral"
-                  : isGuard
-                    ? local
-                      ? "green"
-                      : "amber"
-                    : fresh
-                      ? "green"
-                      : "neutral"
-              }
-            >
-              <span className="status-dot" />
-              {isResident
-                ? "Resident portal"
-                : isGuard
-                  ? local
+            {isGuard ? (
+              <>
+                <Badge
+                  tone={cloudAvailable ? "green" : cloudAvailable === false ? "amber" : "neutral"}
+                >
+                  <span className="status-dot" />
+                  {cloudAvailable
+                    ? "Cloud dashboard connected"
+                    : cloudAvailable === false
+                      ? "Cloud unavailable"
+                      : "Checking cloud"}
+                </Badge>
+                <Badge
+                  tone={localAvailable ? "green" : localAvailable === false ? "amber" : "neutral"}
+                >
+                  <span className="status-dot" />
+                  {localAvailable
                     ? "Local station connected"
-                    : "Station unavailable"
+                    : localAvailable === false
+                      ? EDGE
+                        ? "Local station unavailable"
+                        : "Local station not configured"
+                      : "Checking local station"}
+                </Badge>
+              </>
+            ) : (
+              <Badge tone={isResident ? "neutral" : fresh ? "green" : "neutral"}>
+                <span className="status-dot" />
+                {isResident
+                  ? "Resident portal"
                   : fresh
                     ? "Controller connected"
                     : "Awaiting controller"}
-            </Badge>
+              </Badge>
+            )}
             <button className="icon-button" onClick={() => void load()} aria-label="Refresh">
               <RefreshCw size={17} />
             </button>
@@ -1431,17 +1581,21 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
                 {isResident
                   ? "A LITTLE CLOSER TO HOME"
                   : isGuard
-                    ? "PALM GROVE · MAIN ENTRANCE"
+                    ? `${organizationName} · ${assignedSite?.name ?? "Gate station"}`.toUpperCase()
                     : "CONNECTED COMMUNITY"}
               </p>
               <h1>
                 {tab === "Overview"
                   ? "Your village, at a glance."
                   : tab === "My home"
-                    ? "Welcome home, Andrea."
+                    ? firstName
+                      ? `Welcome home, ${firstName}.`
+                      : "Welcome home."
                     : tab === "Gate station"
                       ? "Every arrival, a warm welcome."
-                      : tab}
+                      : tab === "Security"
+                        ? "Account security"
+                        : tab}
               </h1>
               <p className="subtitle">
                 {isResident
@@ -1468,6 +1622,12 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
             <div className="notice warning" role="status">
               <WifiOff size={17} />
               {error}
+            </div>
+          )}
+          {isGuard && localError && tab === "Gate station" && (
+            <div className="notice warning" role="status">
+              <WifiOff size={17} />
+              {localError}
             </div>
           )}
           {notice && (
@@ -1516,7 +1676,6 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
                   <div className="road-line" />
                   <div className="tree tree-one" />
                   <div className="tree tree-two" />
-                  <span className="illustration-label">PALM GROVE</span>
                 </div>
               </section>
               <section className="stats">
@@ -1591,11 +1750,20 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
                 <section className="panel gate-card">
                   <div className="panel-heading">
                     <div>
-                      <h3>{isResident ? "A note about your access" : "Main gate"}</h3>
+                      <h3>
+                        {isResident
+                          ? "A note about your access"
+                          : (assignedSite?.name ?? "No gate set up yet")}
+                      </h3>
                       <p>
                         {isResident
                           ? "Designed around your everyday."
-                          : "Entry lane · Hikvision pilot target"}
+                          : assignedSite
+                            ? gateLanes.map((lane) => lane.name).join(" · ") ||
+                              "No lanes set up yet"
+                            : isGuard
+                              ? "No station is assigned to your account."
+                              : "Add a site and lane in Gates & devices."}
                       </p>
                     </div>
                     <DoorOpen size={22} />
@@ -2943,23 +3111,39 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
                 <Stat
                   icon={<DoorOpen />}
                   label="Operating mode"
-                  value={local ? "Local" : "Unavailable"}
+                  value={local ? local.hardware : EDGE ? "Unavailable" : "Not configured"}
                   detail={
-                    localLaneLabel ? "Assigned lanes · " + localLaneLabel : "Simulator · Main gate"
+                    localLaneLabel
+                      ? "Assigned lanes · " + localLaneLabel
+                      : "Local station status from this browser's on-device service"
                   }
                 />
                 <Stat
                   icon={<Wifi />}
-                  label="Cloud link"
-                  value={local?.cloud_connected ? "Connected" : "Offline"}
+                  label="Edge cloud sync"
+                  value={local ? (local.cloud_connected ? "Connected" : "Offline") : "—"}
                   detail={
-                    local?.authorization_available === false
-                      ? "Local authorization is paused; ask the HOA for help"
-                      : local?.max_config_age_seconds
-                        ? "Cached access limit: " +
-                          Math.round(local.max_config_age_seconds / 3600) +
-                          " hours"
-                        : "Cached permissions stay local in demo mode"
+                    !local
+                      ? "Reported by the local station service when connected"
+                      : local.authorization_available === false
+                        ? "Local authorization is paused; ask the HOA for help"
+                        : local?.max_config_age_seconds
+                          ? "Cached access limit: " +
+                            Math.round(local.max_config_age_seconds / 3600) +
+                            " hours"
+                          : "Cached permissions stay local in demo mode"
+                  }
+                />
+                <Stat
+                  icon={<Activity />}
+                  label="Controller heartbeat"
+                  value={
+                    heartbeatIsFresh ? "Recent" : heartbeat ? "No recent report" : "None received"
+                  }
+                  detail={
+                    heartbeat
+                      ? `Last cloud report ${formatWhen(heartbeat.received_at)} · config v${heartbeat.payload.config_version}`
+                      : "No cloud controller heartbeat is recorded yet"
                   }
                 />
                 <Stat
@@ -2979,75 +3163,82 @@ function PortalWorkspace({ mode, auth }: { mode: Mode; auth: ReturnType<typeof u
                   detail="Stored before cloud upload"
                 />
               </section>
-              <div className="two-columns">
-                <section className="panel">
-                  <div className="panel-heading">
-                    <div>
-                      <h3>Simulate a vehicle arrival</h3>
-                      <p>Exercise local authorization without moving physical equipment.</p>
+              {SIMULATOR_ENABLED && EDGE && (
+                <div className="two-columns">
+                  <section className="panel">
+                    <div className="panel-heading">
+                      <div>
+                        <h3>Simulate a vehicle arrival</h3>
+                        <p>Exercise local authorization without moving physical equipment.</p>
+                      </div>
+                      <Radio size={22} />
                     </div>
-                    <Radio size={22} />
-                  </div>
-                  <form className="scan-form" onSubmit={scan}>
-                    <label>
-                      Credential format
-                      <select value={scanFormat} onChange={(e) => setScanFormat(e.target.value)}>
-                        <option value="epc">EPC / UHF</option>
-                        <option value="wiegand26">Wiegand 26 payload</option>
-                        <option value="wiegand34">Wiegand 34 payload</option>
-                      </select>
-                    </label>
-                    <label>
-                      Credential value
-                      <input
-                        value={scanValue}
-                        onChange={(e) => setScanValue(e.target.value)}
-                        required
-                        maxLength={64}
-                        className="mono"
-                      />
-                    </label>
-                    <button className="button primary" disabled={busy || !local}>
-                      <Radio size={17} />
-                      {busy ? "Reading…" : "Present credential"}
-                    </button>
-                  </form>
-                </section>
-                <section className="panel result-panel">
-                  {result ? (
-                    <>
-                      <span
-                        className={"result-icon " + (result.decision === "granted" ? "" : "denied")}
-                      >
-                        {result.decision === "granted" ? <Check size={32} /> : <X size={32} />}
-                      </span>
-                      <h2>{result.decision === "granted" ? "Access granted" : "Access denied"}</h2>
-                      <p>{result.vehicle_plate ?? "Unrecognized vehicle"}</p>
-                      <Badge tone={result.decision === "granted" ? "green" : "amber"}>
-                        {labels[result.reason] ?? result.reason}
-                      </Badge>
-                      <small>
-                        {result.barrier_outcome === "simulated_open"
-                          ? "Simulated opening recorded. Vehicle passage is unconfirmed."
-                          : result.barrier_outcome === "cooldown"
-                            ? "Opening suppressed while lane cooldown is active."
-                            : "No barrier movement confirmed."}
-                      </small>
-                    </>
-                  ) : (
-                    <>
-                      <span className="result-icon">
-                        <CarFront size={32} />
-                      </span>
-                      <h3>Ready for the next arrival</h3>
-                      <p>The local decision will appear here.</p>
-                    </>
-                  )}
-                </section>
-              </div>
+                    <form className="scan-form" onSubmit={scan}>
+                      <label>
+                        Credential format
+                        <select value={scanFormat} onChange={(e) => setScanFormat(e.target.value)}>
+                          <option value="epc">EPC / UHF</option>
+                          <option value="wiegand26">Wiegand 26 payload</option>
+                          <option value="wiegand34">Wiegand 34 payload</option>
+                        </select>
+                      </label>
+                      <label>
+                        Credential value
+                        <input
+                          value={scanValue}
+                          onChange={(e) => setScanValue(e.target.value)}
+                          required
+                          maxLength={64}
+                          className="mono"
+                        />
+                      </label>
+                      <button className="button primary" disabled={busy || !local}>
+                        <Radio size={17} />
+                        {busy ? "Reading…" : "Present credential"}
+                      </button>
+                    </form>
+                  </section>
+                  <section className="panel result-panel">
+                    {result ? (
+                      <>
+                        <span
+                          className={
+                            "result-icon " + (result.decision === "granted" ? "" : "denied")
+                          }
+                        >
+                          {result.decision === "granted" ? <Check size={32} /> : <X size={32} />}
+                        </span>
+                        <h2>
+                          {result.decision === "granted" ? "Access granted" : "Access denied"}
+                        </h2>
+                        <p>{result.vehicle_plate ?? "Unrecognized vehicle"}</p>
+                        <Badge tone={result.decision === "granted" ? "green" : "amber"}>
+                          {labels[result.reason] ?? result.reason}
+                        </Badge>
+                        <small>
+                          {result.barrier_outcome === "simulated_open"
+                            ? "Simulated opening recorded. Vehicle passage is unconfirmed."
+                            : result.barrier_outcome === "cooldown"
+                              ? "Opening suppressed while lane cooldown is active."
+                              : "No barrier movement confirmed."}
+                        </small>
+                      </>
+                    ) : (
+                      <>
+                        <span className="result-icon">
+                          <CarFront size={32} />
+                        </span>
+                        <h3>Ready for the next arrival</h3>
+                        <p>The local decision will appear here.</p>
+                      </>
+                    )}
+                  </section>
+                </div>
+              )}
               <EventTable events={events.slice(0, 8)} />
             </>
           )}
+          {tab === "Security" && <SecurityPanel api={API} auth={auth} />}
           {tab === "Help" && (
             <section className="panel help-panel">
               <ShieldCheck size={28} />
