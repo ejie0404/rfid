@@ -21,7 +21,23 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApp } from "../apps/api/dist/app.js";
+import { totpCode } from "../apps/api/dist/crypto.js";
 import { migrationFiles } from "../apps/api/dist/migrations.js";
+
+/** Production requires privileged accounts to enroll an authenticator before they can act. */
+async function enrollMfa(call, token, label) {
+  const started = await call("POST", "/auth/mfa/enroll", undefined, token);
+  if (started.statusCode !== 201)
+    throw new Error(`Worker verification ${label} MFA enrollment failed.`);
+  const confirmed = await call(
+    "POST",
+    "/auth/mfa/confirm",
+    { code: totpCode(started.json().secret) },
+    token,
+  );
+  if (confirmed.statusCode !== 201)
+    throw new Error(`Worker verification ${label} MFA confirmation failed.`);
+}
 
 const adminUrl = process.env.SMARTGATE_PG_ADMIN_URL || "postgresql://127.0.0.1:5432/postgres";
 const host = new URL(adminUrl).hostname;
@@ -248,12 +264,19 @@ async function verifyWorkerAcrossIdleWindow(database) {
       });
       if (operatorLogin.statusCode !== 201)
         throw new Error("Worker verification operator login failed.");
+      const operatorToken = operatorLogin.json().token;
+      await enrollMfa(call, operatorToken, "operator");
 
-      const organizationId = randomUUID();
-      await store.query(
-        "INSERT INTO organizations(id,name) VALUES($1,'Worker verification village')",
-        [organizationId],
+      // The village is created through the production onboarding endpoint, not direct SQL.
+      const village = await call(
+        "POST",
+        "/platform/organizations",
+        { name: `Worker verification village ${suffix}` },
+        operatorToken,
       );
+      if (village.statusCode !== 201)
+        throw new Error("Worker verification village creation failed.");
+      const organizationId = village.json().id;
       const invitation = await call(
         "POST",
         "/invitations",
@@ -262,7 +285,7 @@ async function verifyWorkerAcrossIdleWindow(database) {
           role: "hoa_admin",
           organization_id: organizationId,
         },
-        operatorLogin.json().token,
+        operatorToken,
       );
       if (invitation.statusCode !== 201) throw new Error("Worker verification invitation failed.");
       const accepted = await call("POST", "/auth/invitations/accept", {
@@ -272,6 +295,8 @@ async function verifyWorkerAcrossIdleWindow(database) {
       });
       if (accepted.statusCode !== 201)
         throw new Error("Worker verification invitation acceptance failed.");
+      const adminToken = accepted.json().token;
+      await enrollMfa(call, adminToken, "village administrator");
 
       /** Enrolls one household and schedules its move-out well after the verification window. */
       const scheduleHouseholdMoveOut = async (platePrefix) => {
@@ -287,7 +312,7 @@ async function verifyWorkerAcrossIdleWindow(database) {
             format: "epc",
             value: randomBytes(12).toString("hex").toUpperCase(),
           },
-          accepted.json().token,
+          adminToken,
         );
         if (enrollment.statusCode !== 201)
           throw new Error("Worker verification household setup failed.");
@@ -299,7 +324,7 @@ async function verifyWorkerAcrossIdleWindow(database) {
             effective_at: new Date(Date.now() + 20 * 60_000).toISOString(),
             reason: "PostgreSQL worker verification",
           },
-          accepted.json().token,
+          adminToken,
         );
         if (schedule.statusCode !== 201)
           throw new Error("Worker verification schedule setup failed.");
@@ -363,7 +388,7 @@ async function verifyWorkerAcrossIdleWindow(database) {
 
     record(
       "standalone PostgreSQL workers survived the idle window and processed due work",
-      "two entrypoints stopped by SIGINT and SIGTERM, one cutoff and audit per schedule, restarted worker completed new work without duplicates",
+      "setup through production MFA enrollment and village onboarding; two entrypoints stopped by SIGINT and SIGTERM, one cutoff and audit per schedule, restarted worker completed new work without duplicates",
     );
   } finally {
     if (workerPool) await workerPool.end();

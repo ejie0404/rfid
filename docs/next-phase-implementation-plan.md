@@ -11,7 +11,7 @@ its first administrator from the management app, with no direct SQL. All 21 Post
 checks passed locally, including the onboarding suite and two production worker entrypoints
 surviving the connection-pool idle period, processing one due move-out at its stored cutoff,
 stopping on SIGINT and SIGTERM, and a restarted worker completing new due work without duplicates.
-The platform test (65 passed, 2 PostgreSQL-only skips), typecheck, build, format, and protocol
+The platform test (70 passed, 2 PostgreSQL-only skips), typecheck, build, format, and protocol
 checks pass, and a local headless-browser onboarding run passed at desktop and phone widths.
 Docker is unavailable here, so image builds and container runtime acceptance remain open; no
 provider deployment or service-restart acceptance has run. Slices 4 through 6 remain open because

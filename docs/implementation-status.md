@@ -180,11 +180,14 @@ See the platform and edge READMEs for restart commands if these local processes 
   address. A build with `http://api.example.test` still shows the configuration screen, HTTPS and
   local loopback exports show sign-in, and a Vercel build with a loopback address fails. The demo
   command now loads the root `.env`.
-- `npm test`: **65 passed, 0 failed, 2 PostgreSQL-only tests skipped** (67 total), including the new
-  onboarding suite.
+- `npm test`: **70 passed, 0 failed, 2 PostgreSQL-only tests skipped** (72 total), including the
+  onboarding and privileged-account MFA suites.
 - `npm run verify:postgres`: **all 21 checks passed** against PostgreSQL 17.11. The onboarding suite
   ran its 4 tests there, including a concurrent duplicate-name check that holds the creation lock so
-  both submissions wait at it. The verifier cleaned up all 12 run-owned databases and both roles.
+  both submissions wait at it. The production worker check now enrolls MFA for its operator and
+  village administrator, as production requires, and creates its village through the onboarding
+  endpoint; without that it stopped at a refused invitation. The verifier cleaned up all 12
+  run-owned databases and both roles.
 - `npm run typecheck`, `npm run build`, `npm run format:check`, `npm run protocol:check`, and
   `git diff --check` passed.
 - A headless Brave run passed 24 checks at 1280×900 and 390×844 against the production static
@@ -192,7 +195,8 @@ See the platform and edge READMEs for restart commands if these local processes 
   creation, the duplicate-name alert, the invitation code and link with clipboard copy and focus
   handling, a first administrator accepting on desktop and a second on phone, no horizontal
   overflow, and no unexpected browser errors. The API then held one village with two members. This
-  used embedded PostgreSQL over loopback HTTP, not a hosted HTTPS deployment.
+  used embedded PostgreSQL over loopback HTTP with the MFA policy off, not a hosted HTTPS
+  deployment. It passed again on the build that includes the Security screens.
 
 ## Important remaining work
 
